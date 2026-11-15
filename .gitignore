@@ -1,0 +1,12 @@
+.tools/
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+
+# build output (make release); releases are published from CI, never committed
+dist/
+
+# Bun formatter tooling has no dependencies; nothing should be installed
+node_modules/
+bun.lock

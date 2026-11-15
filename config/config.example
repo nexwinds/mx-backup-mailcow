@@ -1,0 +1,38 @@
+# mx-backup-mailcow configuration
+#
+# This file is sourced by the application scripts. It is written by install.sh
+# with mode 0600 and owned by root. Keep it readable by root only: it contains
+# the Mailcow API key.
+#
+# Managed keys are rewritten by install.sh; extra lines are preserved.
+
+# Mailcow hostname used for the API (no scheme, no path).
+MAILCOW_HOST="mail.example.com"
+
+# Dedicated read-only API key, restricted to this server's IP in Mailcow.
+MAILCOW_API_KEY="replace-with-read-only-api-key"
+
+# Optional private CA bundle used to verify the Mailcow API certificate.
+MAILCOW_API_CA_FILE=""
+
+# Primary Mailcow IP that queued mail is forwarded to.
+MAILCOW_PRIMARY_IP="203.0.113.10"
+MAILCOW_PRIMARY_PORT=25
+
+# Outbound SMTP TLS policy to the primary: may (opportunistic) or secure.
+# secure requires SMTP_TLS_MATCH_HOSTNAME and a certificate valid for it.
+SMTP_TLS_MODE="may"
+SMTP_TLS_MATCH_HOSTNAME=""
+
+# Space-separated domains to exclude from synchronization.
+EXCLUDE_DOMAINS=""
+
+# Accept every recipient of hosted domains after this many days without a
+# successful API synchronization. 0 disables relaxation (always strict).
+RELAX_AFTER_DAYS=7
+
+# How long queued mail is kept while the primary is unavailable.
+QUEUE_LIFETIME="7d"
+
+# Maximum accepted message size in bytes (100 MB, matches Mailcow's default).
+MESSAGE_SIZE_LIMIT=104857600

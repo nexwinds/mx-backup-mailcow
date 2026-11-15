@@ -1,0 +1,7 @@
+[
+  {"address": "sales@example.com", "goto": "alice@example.com", "active": "1", "is_catch_all": "0"},
+  {"address": "@catchall.test", "goto": "frank@catchall.test", "active": "1", "is_catch_all": "1"},
+  {"address": "info@example.org", "goto": "erin@example.org", "active": "1", "is_catch_all": "0"},
+  {"address": "alias@example.com", "goto": "alice@example.com", "active": "0", "is_catch_all": "0"},
+  {"address": "old@inactive.test", "goto": "someone@example.com", "active": "1", "is_catch_all": "0"}
+]

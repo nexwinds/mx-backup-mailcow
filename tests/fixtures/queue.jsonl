@@ -1,0 +1,2 @@
+{"queue_name":"deferred","queue_id":"4F1A2B3C4D","arrival_time":1767225600,"message_size":4096,"sender":"alice@example.com","recipients":["bob@example.com"],"defer_reason":"connect to 203.0.113.10[203.0.113.10]:25: Connection refused"}
+{"queue_name":"active","queue_id":"5A2B3C4D5E","arrival_time":1767229200,"message_size":2048,"sender":"carol@example.org","recipients":["dave@example.org","erin@example.org"],"defer_reason":null}

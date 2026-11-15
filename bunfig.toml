@@ -1,0 +1,14 @@
+# Formatter configuration for `bun run format`.
+#
+# Only documentation and YAML are formatted: Bun has no parser for the shell
+# scripts, the Makefile or VERSION, so those are never rewritten.
+#
+# Test fixtures are excluded on purpose: they are small Mailcow API payloads
+# kept one object per line so they can be compared with a real response. They
+# are read through jq, so their layout carries no meaning.
+
+[fmt]
+printWidth = 80
+tabWidth = 2
+proseWrap = "preserve"
+ignorePatterns = ["tests/fixtures/"]

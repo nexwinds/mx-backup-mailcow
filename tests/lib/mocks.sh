@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# Command mocks used by the test suite. They are exported as Bash functions,
+# which works on Linux and on Git Bash for Windows (where extensionless
+# executables cannot be launched).
+#
+# Behaviour is controlled through MOCK_* environment variables. Every
+# invocation is appended to $MOCK_DIR/calls.log, which lets tests assert that
+# destructive commands were never called.
+#
+set -uo pipefail
+
+mock_log() { printf '%s\n' "$*" >>"${MOCK_DIR:?}/calls.log"; }
+
+mock_set_unit_state() {
+    local unit=$1 state=$2 file="$MOCK_DIR/systemd.state" line found=0
+    touch "$file"
+    : >"$file.tmp"
+    while IFS= read -r line; do
+        if [[ ${line%%=*} == "$unit" ]]; then
+            printf '%s=%s\n' "$unit" "$state" >>"$file.tmp"
+            found=1
+        else
+            printf '%s\n' "$line" >>"$file.tmp"
+        fi
+    done <"$file"
+    if [[ "$found" -eq 0 ]]; then
+        printf '%s=%s\n' "$unit" "$state" >>"$file.tmp"
+    fi
+    mv "$file.tmp" "$file"
+}
+
+mock_get_unit_state() {
+    grep -F "$1=" "$MOCK_DIR/systemd.state" 2>/dev/null | head -n 1 | cut -d= -f2-
+}
+
+mock_reset_postconf() {
+    cat >"$MOCK_DIR/postconf.state" <<EOF
+compatibility_level = 3.6
+mail_version = 3.8.6
+relay_domains = hash:$MXB_MAPS_DIR/relay_domains
+relay_recipient_maps = hash:$MXB_MAPS_DIR/relay_recipients
+transport_maps = hash:$MXB_MAPS_DIR/transport
+smtp_tls_policy_maps = hash:$MXB_MAPS_DIR/smtp_tls_policy
+mynetworks = 127.0.0.0/8 [::1]/128
+smtpd_relay_restrictions = permit_mynetworks, reject_unauth_destination
+EOF
+}
+
+mock_reset() {
+    rm -rf "$MOCK_DIR" 2>/dev/null || true
+    mkdir -p "$MOCK_DIR"
+    : >"$MOCK_DIR/calls.log"
+    : >"$MOCK_DIR/systemd.state"
+    printf 'Status: inactive\n' >"$MOCK_DIR/ufw.state"
+    mock_reset_postconf
+
+    export MOCK_API_CODE=200
+    export MOCK_GH_CODE=200
+    export MOCK_GH_LATEST=1.0.0
+    export MOCK_API_BAD_JSON=0
+    export MOCK_API_EMPTY=0
+    export MOCK_CURL_FAIL=0
+    export MOCK_POSTMAP_FAIL=0
+    export MOCK_RELOAD_FAIL=0
+    export MOCK_APT_FAIL=0
+    export MOCK_SYSTEMCTL_FAIL=0
+    export MOCK_CORRUPT_ASSET=0
+    export MOCK_GH_RATE_LIMIT=0
+}
+
+mock_calls_contain() { grep -qF -- "$1" "$MOCK_DIR/calls.log"; }
+mock_calls_count() {
+    local n
+    n=$(grep -cF -- "$1" "$MOCK_DIR/calls.log" 2>/dev/null) || true
+    printf '%s' "${n:-0}"
+}
+mock_clear_calls() { : >"$MOCK_DIR/calls.log"; }
+
+# ---------------------------------------------------------------------------
+# curl
+# ---------------------------------------------------------------------------
+curl() {
+    local out="" writeout="" url="" config=0 failmode=0 code=200 body="" src=""
+    local -a positional=()
+    while (( $# > 0 )); do
+        case "$1" in
+            -o|--output) out=${2:-}; shift 2 ;;
+            -w|--write-out) writeout=${2:-}; shift 2 ;;
+            -K|--config)
+                [[ ${2:-} == "-" ]] && config=1
+                shift 2
+                ;;
+            --cacert|--proto|--proto-redir|--connect-timeout|--max-time|--retry|--retry-delay|-H|--header|--max-redirs)
+                shift 2
+                ;;
+            --silent|--show-error|--tlsv1.2|--compressed|--location)
+                shift
+                ;;
+            --fail) failmode=1; shift ;;
+            *)
+                positional+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ "$config" -eq 1 ]]; then
+        local cfg
+        cfg=$(cat)
+        url=$(printf '%s\n' "$cfg" | sed -n 's/^url = "\(.*\)"$/\1/p' | head -n 1)
+    fi
+    if [[ -z "$url" && ${#positional[@]} -gt 0 ]]; then
+        url=${positional[${#positional[@]} - 1]}
+    fi
+
+    mock_log "curl $url"
+
+    if [[ "${MOCK_CURL_FAIL:-0}" == "1" ]]; then
+        [[ -n "$out" ]] && : >"$out"
+        [[ -n "$writeout" ]] && printf '000'
+        return 7
+    fi
+
+    case "$url" in
+        *"/api/v1/get/domain/all"*)       code=${MOCK_API_CODE:-200}; src="$MOCK_FIXTURES/domains.json" ;;
+        *"/api/v1/get/mailbox/all"*)      code=${MOCK_API_CODE:-200}; src="$MOCK_FIXTURES/mailboxes.json" ;;
+        *"/api/v1/get/alias-domain/all"*) code=${MOCK_API_CODE:-200}; src="$MOCK_FIXTURES/alias_domains.json" ;;
+        *"/api/v1/get/alias/all"*)        code=${MOCK_API_CODE:-200}; src="$MOCK_FIXTURES/aliases.json" ;;
+        *api.github.com*)
+            code=${MOCK_GH_CODE:-200}
+            [[ "${MOCK_GH_RATE_LIMIT:-0}" == "1" ]] && code=403
+            case "$url" in
+                */releases/latest)
+                    body="{\"tag_name\":\"v${MOCK_GH_LATEST:-1.0.0}\",\"name\":\"v${MOCK_GH_LATEST:-1.0.0}\"}"
+                    ;;
+                */releases/tags/*)
+                    local tag=${url##*/tags/v}
+                    body="{\"tag_name\":\"v${tag}\",\"name\":\"v${tag}\"}"
+                    ;;
+                */releases*)
+                    body='[{"tag_name":"v9.9.9","published_at":"2026-01-01T00:00:00Z"},{"tag_name":"v1.0.0","published_at":"2025-12-01T00:00:00Z"}]'
+                    ;;
+                *)
+                    code=404
+                    body='{"message":"Not Found"}'
+                    ;;
+            esac
+            ;;
+        *github.com*/releases/download/v*)
+            local rest ver asset
+            rest=${url##*/releases/download/v}
+            ver=${rest%%/*}
+            asset=${rest#*/}
+            src="$MOCK_RELEASE_DIR/$asset"
+            [[ -f "$src" ]] || src="$MOCK_RELEASE_DIR-$ver/$asset"
+            if [[ -f "$src" ]]; then
+                code=200
+                if [[ "${MOCK_CORRUPT_ASSET:-0}" == "1" && "$asset" == *.tar.gz ]]; then
+                    cp "$src" "$out"
+                    printf 'corrupt' >>"$out"
+                    src=""
+                fi
+            else
+                code=404
+            fi
+            ;;
+        *)
+            code=404
+            body='{"message":"Not Found"}'
+            ;;
+    esac
+
+    if [[ -n "$src" && -f "$src" ]]; then
+        if [[ "$url" == *"/api/v1/get/"* ]]; then
+            if [[ "${MOCK_API_EMPTY:-0}" == "1" ]]; then
+                src=""
+                body="{}"
+            fi
+            if [[ "${MOCK_API_BAD_JSON:-0}" == "1" ]]; then
+                src=""
+                body="{not json"
+            fi
+        fi
+    fi
+
+    if [[ -n "$src" && -f "$src" ]]; then
+        if [[ -n "$out" ]]; then cp "$src" "$out"; else cat "$src"; fi
+    elif [[ -n "$body" ]]; then
+        if [[ -n "$out" ]]; then printf '%s' "$body" >"$out"; else printf '%s' "$body"; fi
+    elif [[ -n "$out" && "$code" == "200" ]]; then
+        : >"$out"
+    fi
+
+    if [[ -n "$writeout" ]]; then
+        printf '%s' "$code"
+    fi
+    if [[ "$failmode" -eq 1 && "$code" != "200" ]]; then
+        return 22
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Postfix tools
+# ---------------------------------------------------------------------------
+postmap() {
+    mock_log "postmap $*"
+    local key="" dump=0 path=""
+    while (( $# > 0 )); do
+        case "$1" in
+            -q) key=${2:-}; shift 2 ;;
+            -s) dump=1; shift ;;
+            *) path=$1; shift ;;
+        esac
+    done
+    path=${path#hash:}
+    [[ "${MOCK_POSTMAP_FAIL:-0}" == "1" ]] && return 1
+    if [[ ! -f "$path" ]]; then
+        printf 'postmap: open %s: No such file or directory\n' "$path" >&2
+        return 1
+    fi
+    if [[ -n "$key" ]]; then
+        local lookup_file
+        lookup_file="$path"
+        [[ -f "$path.db" ]] && lookup_file="$path.db"
+        awk -v k="$key" 'tolower($1) == tolower(k) { print $2; found = 1; exit } END { if (!found) exit 1 }' "$lookup_file"
+        return
+    fi
+    if [[ "$dump" -eq 1 ]]; then
+        cat "$path"
+        return 0
+    fi
+    cp "$path" "$path.db"
+}
+
+postconf() {
+    mock_log "postconf $*"
+    local state="$MOCK_DIR/postconf.state"
+    case "${1:-}" in
+        -e)
+            local kv key val
+            kv=${2:-}
+            key=$(printf '%s' "$kv" | awk -F'=' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1}')
+            val=$(printf '%s' "$kv" | awk -F'=' '{sub(/^[^=]*=/, ""); gsub(/^[ \t]+|[ \t]+$/, "", $0); print}')
+            touch "$state"
+            awk -v k="$key" -v v="$val" '
+                BEGIN { done = 0 }
+                { split($0, a, " = "); if (a[1] == k) { print k " = " v; done = 1 } else print }
+                END { if (!done) print k " = " v }
+            ' "$state" >"$state.tmp"
+            mv "$state.tmp" "$state"
+            ;;
+        -h)
+            awk -F' = ' -v k="${2:-}" '$1 == k { sub(/^[^=]*= */, ""); print; exit }' "$state"
+            ;;
+        -d)
+            case "${2:-}" in
+                compatibility_level) printf 'compatibility_level = 3.6\n' ;;
+                mail_version) printf 'mail_version = 3.8.6\n' ;;
+                *) printf '%s = \n' "${2:-}" ;;
+            esac
+            ;;
+        -n) cat "$state" ;;
+        -M)
+            printf 'smtp      inet  n       -       y       -       -       smtpd\n'
+            printf 'pickup    unix  n       -       y       60      1       pickup\n'
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+postfix() {
+    mock_log "postfix $*"
+    case "${1:-}" in
+        reload)
+            [[ "${MOCK_RELOAD_FAIL:-0}" == "1" ]] && return 1
+            return 0
+            ;;
+        status|check|start|stop|set-permissions) return 0 ;;
+        *) return 0 ;;
+    esac
+}
+
+postqueue() {
+    mock_log "postqueue $*"
+    case "${1:-}" in
+        -j)
+            [[ -n "${MOCK_QUEUE_JSONL:-}" && -f "$MOCK_QUEUE_JSONL" ]] && cat "$MOCK_QUEUE_JSONL"
+            ;;
+        -p)
+            [[ -n "${MOCK_QUEUE_TEXT:-}" && -f "$MOCK_QUEUE_TEXT" ]] && cat "$MOCK_QUEUE_TEXT"
+            ;;
+        *) return 0 ;;
+    esac
+    return 0
+}
+
+newaliases() { mock_log "newaliases $*"; return 0; }
+
+# ---------------------------------------------------------------------------
+# systemd and system tools
+# ---------------------------------------------------------------------------
+systemctl() {
+    mock_log "systemctl $*"
+    [[ "${MOCK_SYSTEMCTL_FAIL:-0}" == "1" ]] && return 1
+    local cmd=${1:-} unit
+    shift || true
+    case "$cmd" in
+        daemon-reload) return 0 ;;
+        enable|start)
+            unit=${!#}
+            if [[ "$cmd" == "enable" ]]; then
+                mock_set_unit_state "$unit" enabled
+            else
+                mock_set_unit_state "$unit" active
+            fi
+            return 0
+            ;;
+        is-active)
+            unit=${!#}
+            [[ "$(mock_get_unit_state "$unit")" == "active" ]]
+            return
+            ;;
+        is-enabled)
+            unit=${!#}
+            local state
+            state=$(mock_get_unit_state "$unit")
+            [[ "$state" == "enabled" || "$state" == "active" ]]
+            return
+            ;;
+        status) printf 'active (running)\n'; return 0 ;;
+        list-timers)
+            printf 'NEXT                        LEFT     LAST                        PASSED   UNIT                ACTIVATES\n'
+            printf 'Wed 2026-01-01 00:15:00 UTC 1h left  Tue 2025-12-31 22:15:00 UTC 1h ago   mailcow-sync.timer  mailcow-sync.service\n'
+            return 0
+            ;;
+        show) printf 'ActiveState=active\nNextElapseUSecRealtime=Wed 2026-01-01 00:15:00 UTC\n'; return 0 ;;
+        cat) return 0 ;;
+        --failed) return 0 ;;
+        *) return 0 ;;
+    esac
+}
+
+journalctl() {
+    mock_log "journalctl $*"
+    if [[ -s "$MOCK_JOURNAL" ]]; then
+        cat "$MOCK_JOURNAL"
+    else
+        printf -- '-- No entries --\n'
+    fi
+    return 0
+}
+
+ss() { mock_log "ss $*"; printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\nLISTEN 0 100 0.0.0.0:25 0.0.0.0:*\n'; }
+
+free() { mock_log "free $*"; printf '               total        used        free\nMem:            2048         512        1024\n'; }
+
+df() { mock_log "df $*"; printf 'Filesystem      Size  Used Avail Use%% Mounted on\n/dev/sda1        40G  8.0G   30G  22%% /\n'; }
+
+timedatectl() { mock_log "timedatectl $*"; printf 'System clock synchronized: yes\nNTP service: active\n'; }
+
+openssl() {
+    mock_log "openssl $*"
+    printf 'subject=CN = mail.example.com\nissuer=C = US, O = Test CA, CN = Test CA\nnotBefore=Jan  1 00:00:00 2026 GMT\nnotAfter=Apr  1 00:00:00 2026 GMT\n'
+}
+
+getent() { mock_log "getent $*"; printf '203.0.113.10    mail.example.com\n'; }
+
+needrestart() { mock_log "needrestart $*"; printf 'NEEDRESTART-VER: 3.5\n'; }
+
+ufw() {
+    mock_log "ufw $*"
+    case "$*" in
+        *"status"*)
+            [[ "$*" == *"status"* && "$*" != *"--force"* ]] && cat "$MOCK_DIR/ufw.state"
+            ;;
+    esac
+    if [[ "$*" == *"--force enable"* ]]; then
+        printf 'Status: active\n' >"$MOCK_DIR/ufw.state"
+    fi
+    return 0
+}
+
+hostname() {
+    mock_log "hostname $*"
+    printf '%s\n' "${MOCK_FQDN:-mx2.example.com}"
+}
+
+dpkg() { mock_log "dpkg $*"; return 0; }
+
+dpkg-query() {
+    mock_log "dpkg-query $*"
+    if [[ "$*" == *Status* ]]; then
+        printf 'install ok installed\n'
+    else
+        printf 'postfix 3.8.6-1ubuntu0.1\n'
+    fi
+    return 0
+}
+
+apt-get() {
+    mock_log "apt-get $*"
+    if [[ "${MOCK_APT_FAIL:-0}" == "1" ]]; then
+        printf 'E: Failed to fetch http://archive.ubuntu.com/ubuntu/pool/main/x/x.deb  503  Service Unavailable\n'
+        return 100
+    fi
+    printf 'Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease\n'
+    printf 'Reading package lists... Done\n'
+    printf '3 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n'
+    printf 'Setting up postfix (3.8.6-1ubuntu0.1) ...\n'
+    return 0
+}
+
+timeout() {
+    mock_log "timeout $*"
+    shift
+    "$@"
+}
+
+export -f mock_log mock_set_unit_state mock_get_unit_state mock_reset_postconf
+export -f curl postmap postconf postfix postqueue newaliases
+export -f systemctl journalctl ss free df timedatectl openssl getent needrestart ufw hostname
+export -f dpkg dpkg-query apt-get timeout

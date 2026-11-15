@@ -1,0 +1,5 @@
+[
+  {"alias_domain": "alias.test", "target_domain": "example.com", "active": "1"},
+  {"alias_domain": "old.test", "target_domain": "inactive.test", "active": "1"},
+  {"alias_domain": "off.test", "target_domain": "example.com", "active": "0"}
+]

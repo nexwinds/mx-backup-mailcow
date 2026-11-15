@@ -1,0 +1,17 @@
+[Unit]
+Description=Mailcow Backup MX domain and recipient synchronization
+Documentation=https://github.com/nexwinds/mx-backup-mailcow
+After=network-online.target postfix.service
+Wants=network-online.target
+ConditionPathExists=/etc/mailcow-backup-mx/config
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sync-mailcow
+Nice=10
+IOSchedulingClass=best-effort
+TimeoutStartSec=15min
+PrivateTmp=yes
+ProtectHome=yes
+NoNewPrivileges=yes
+SyslogIdentifier=mailcow-sync

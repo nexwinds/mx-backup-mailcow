@@ -1,0 +1,9 @@
+[
+  {"username": "alice@example.com", "active": "1"},
+  {"username": "Bob@Example.com", "active": "1"},
+  {"username": "carol@example.com", "active": "0"},
+  {"username": "dave@inactive.test", "active": "1"},
+  {"username": "erin@example.org", "active": "1"},
+  {"username": "frank@catchall.test", "active": "1"},
+  {"username": "ghost@external.test", "active": "1"}
+]

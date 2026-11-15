@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ShellCheck and tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck jq
+
+      - name: Static analysis
+        run: make lint
+
+      - name: Test suite
+        run: make test
+
+      - name: Build release artifacts
+        run: make release
+
+      - name: Verify release checksums
+        run: |
+          cd dist
+          sha256sum -c SHA256SUMS

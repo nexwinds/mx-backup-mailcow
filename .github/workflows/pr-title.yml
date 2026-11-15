@@ -1,0 +1,28 @@
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  conventional-title:
+    name: Conventional Commit title
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate pull request title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -eu
+          types='feat|fix|docs|test|refactor|perf|build|ci|chore|revert'
+          pattern="^(${types})(\([a-z0-9._/-]+\))?!?: .+"
+          printf 'title: %s\n' "$TITLE"
+          if [[ ! $TITLE =~ $pattern ]]; then
+            printf '%s\n' \
+              "::error::Pull request title must look like 'fix(sync): fall back to cache on HTTP 429'." \
+              "::error::Allowed types: feat fix docs test refactor perf build ci chore revert. See CONTRIBUTING.md."
+            exit 1
+          fi

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Mailcow Backup MX synchronization every two hours
+
+[Timer]
+OnCalendar=*-*-* 00/2:15:00
+RandomizedDelaySec=10m
+AccuracySec=1m
+Persistent=true
+Unit=mailcow-sync.service
+
+[Install]
+WantedBy=timers.target

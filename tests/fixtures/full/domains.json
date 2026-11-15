@@ -1,0 +1,7 @@
+[
+  {"domain_name": "example.com", "active": "1", "relay_all_recipients": "0", "aliases_in_domain": 2},
+  {"domain_name": "example.org", "active": "1", "relay_all_recipients": "1"},
+  {"domain_name": "catchall.test", "active": "1", "relay_all_recipients": "0"},
+  {"domain_name": "alias.test", "active": "1", "relay_all_recipients": "0"},
+  {"domain_name": "inactive.test", "active": "0", "relay_all_recipients": "0"}
+]

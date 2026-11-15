@@ -1,0 +1,10 @@
+{
+  "name": "mx-backup-mailcow",
+  "private": true,
+  "description": "Backup MX for Mailcow on Ubuntu 24.04 with standalone Postfix",
+  "license": "MIT",
+  "scripts": {
+    "format": "bun fmt",
+    "format:check": "bun fmt --check"
+  }
+}
