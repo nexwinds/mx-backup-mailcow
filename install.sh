@@ -30,6 +30,7 @@ PROG_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 : "${MXB_SYSTEMD_DIR:=/etc/systemd/system}"
 : "${MXB_LOGROTATE_DIR:=/etc/logrotate.d}"
 : "${MXB_POSTFIX_ETC:=/etc/postfix}"
+: "${MXB_POSTFIX_TEMPLATE_DIR:=/usr/share/postfix}"
 : "${MXB_SSH_DIR:=/etc/ssh}"
 : "${MXB_CA_BUNDLE:=/etc/ssl/certs/ca-certificates.crt}"
 
@@ -123,6 +124,7 @@ log() {
 
 warn() { log "WARN: $*"; }
 err()  { log "ERROR: $*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
 die() {
     err "$*"
@@ -626,17 +628,83 @@ EOF
     fi
 }
 
+# The Ubuntu postfix package skips main.cf when it is installed with the
+# "No configuration" mailer type (which this installer selects so the package
+# never starts with stock settings), and some releases skip master.cf as well.
+# Postfix then refuses to start and every postconf call fails, so the package
+# templates must be restored before the configuration is written.
+ensure_postfix_config() {
+    local dir=$1 name src candidate
+    local -a candidates
+
+    for name in main.cf master.cf; do
+        [[ -f "$dir/$name" ]] && continue
+        if [[ "$name" == "main.cf" ]]; then
+            candidates=(
+                "$MXB_POSTFIX_TEMPLATE_DIR/main.cf.debian"
+                "$MXB_POSTFIX_TEMPLATE_DIR/main.cf.proto"
+                "$MXB_POSTFIX_TEMPLATE_DIR/main.cf.default"
+                "/etc/postfix/main.cf.proto"
+                "/usr/share/postfix/main.cf.proto"
+            )
+        else
+            candidates=(
+                "$MXB_POSTFIX_TEMPLATE_DIR/master.cf.dist"
+                "$MXB_POSTFIX_TEMPLATE_DIR/master.cf.proto"
+                "/etc/postfix/master.cf.proto"
+                "/usr/lib/postfix/master.cf.dist"
+            )
+        fi
+        src=""
+        for candidate in "${candidates[@]}"; do
+            [[ -r "$candidate" ]] && { src=$candidate; break; }
+        done
+        [[ -n "$src" ]] || die "no Postfix $name template found; reinstall the postfix package"
+        install -m 0644 "$src" "$dir/$name"
+        log "restored $dir/$name from $src"
+    done
+}
+
+# Postfix reports the compiled-in default (0) when no main.cf sets a
+# compatibility level. Levels below 2 select legacy compatibility defaults,
+# so prefer the effective value, then the value in main.cf, then the default.
+valid_compatibility_level() {
+    local value=${1:-}
+    [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+    (( ${value%%.*} >= 2 ))
+}
+
+postfix_compatibility_level() {
+    local main_cf=$1 value=""
+
+    if have postconf; then
+        value=$(postconf -h compatibility_level 2>/dev/null | tr -d '[:space:]' || true)
+        valid_compatibility_level "$value" && { printf '%s' "$value"; return 0; }
+    fi
+    if [[ -r "$main_cf" ]]; then
+        value=$(awk -F= '/^[[:space:]]*compatibility_level[[:space:]]*=/ {
+                   gsub(/[[:space:]]/, "", $2); print $2; exit }' "$main_cf" 2>/dev/null || true)
+        valid_compatibility_level "$value" && { printf '%s' "$value"; return 0; }
+    fi
+    if have postconf; then
+        value=$(postconf -d -h compatibility_level 2>/dev/null | tr -d '[:space:]' || true)
+        valid_compatibility_level "$value" && { printf '%s' "$value"; return 0; }
+    fi
+    printf '3.6'
+}
+
 configure_postfix() {
     local maps="$MXB_MAPS_DIR" compat
     local -a settings=()
 
     mkdir -p "$MXB_POSTFIX_ETC"
+    ensure_postfix_config "$MXB_POSTFIX_ETC"
     if [[ ! -f "$MXB_POSTFIX_ETC/main.cf.pre-mx-backup-mailcow" ]]; then
         cp -p "$MXB_POSTFIX_ETC/main.cf" "$MXB_POSTFIX_ETC/main.cf.pre-mx-backup-mailcow" 2>/dev/null || true
     fi
 
-    compat=$(postconf -d compatibility_level 2>/dev/null | awk '{print $3}')
-    [[ -n "$compat" ]] || compat="3.6"
+    compat=$(postfix_compatibility_level "$MXB_POSTFIX_ETC/main.cf")
+    log "using Postfix compatibility_level $compat"
 
     settings=(
         "compatibility_level = $compat"
@@ -697,6 +765,8 @@ configure_postfix() {
         postconf -e "$item" >>"$MXB_LOG_DIR/install.log" 2>&1 \
             || die "postconf failed for: $item"
     done
+    [[ -s "$MXB_POSTFIX_ETC/main.cf" ]] \
+        || die "Postfix main.cf is missing after configuration"
 
     # Local operational mail is discarded: this server never stores mail.
     cat >"$maps/aliases" <<'EOF'
@@ -725,11 +795,20 @@ EOF
             || die "postmap failed for $name"
     done
 
+    # The package may skip its spool permission fixup when installed with the
+    # "No configuration" mailer type; running it again is idempotent.
+    postfix set-permissions >>"$MXB_LOG_DIR/install.log" 2>&1 \
+        || warn "postfix set-permissions reported issues"
+
     systemctl enable postfix
     if systemctl is-active --quiet postfix; then
         postfix reload
     else
-        systemctl start postfix
+        systemctl start postfix \
+            || die "Postfix did not start; inspect: journalctl -u postfix -n 50 --no-pager"
+    fi
+    if ! systemctl is-active --quiet postfix; then
+        die "Postfix is not active after start; inspect: journalctl -u postfix -n 50 --no-pager"
     fi
     postfix check >>"$MXB_LOG_DIR/install.log" 2>&1 || warn "postfix check reported issues"
     log "Postfix configured as a backup MX"

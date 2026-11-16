@@ -21,6 +21,8 @@ cat >"$MOCK_JOURNAL" <<EOF
 2026-01-01T00:00:01Z mx2 sync-mailcow: loaded key $API_KEY
 2026-01-01T00:00:02Z mx2 postfix/smtp[124]: ABC123: to=<bob@example.com>, relay=203.0.113.10[203.0.113.10]:25, status=deferred (connect refused)
 2026-01-01T00:00:03Z mx2 sshd[125]: Failed password for root from 192.0.2.5
+2026-01-01T00:00:04Z mx2 systemd[1]: Failed to start postfix@-.service - Postfix Mail Transport Agent (instance -).
+2026-01-01T00:00:05Z mx2 systemd[1]: Failed to start getty@tty1.service - Getty on tty1.
 -----BEGIN OPENSSH PRIVATE KEY-----
 AAAAB3NzaC1yc2EAAAADAQABAAABgQC7examplePrivateKeyMaterial
 -----END OPENSSH PRIVATE KEY-----
@@ -42,6 +44,9 @@ assert_contains "$LAST_OUTPUT" "Queue summary" "queue summary present"
 assert_contains "$LAST_OUTPUT" "deferred" "queue state reported"
 assert_contains "$LAST_OUTPUT" "connect to 203.0.113.10" "deferral reason reported"
 assert_contains "$LAST_OUTPUT" "## 6. Application version and updates" "update section"
+assert_contains "$LAST_OUTPUT" "mailcow_host: mail.example.com" "configuration summary is in the report stream"
+assert_contains "$LAST_OUTPUT" "installed_version:" "installed version is reported"
+assert_contains "$LAST_OUTPUT" "notAfter=" "certificate validity is reported"
 
 begin "credentials and private keys are redacted"
 assert_not_contains "$LAST_OUTPUT" "$API_KEY" "API key must not appear"
@@ -88,5 +93,15 @@ report=$(printf '%s\n' "$LAST_OUTPUT" | tail -n 1)
 assert_file "$report" "report file created"
 assert_mode "$report" "600" "report must be private"
 assert_contains "$(cat "$report")" "## AI analysis prompt" "file report contains the prompt"
+assert_contains "$(cat "$report")" "mailcow_host: mail.example.com" "configuration summary is written to the report"
+assert_contains "$(cat "$report")" "$MXB_CONFIG_FILE" "file permissions are written to the report"
+assert_contains "$(cat "$report")" "installed_version:" "installed version is written to the report"
+assert_eq "$(printf '%s\n' "$LAST_OUTPUT" | wc -l | tr -d ' ')" "1" "stdout must contain only the report path"
+
+begin "unit name masking is limited to address-like names"
+assert_contains "$(cat "$report")" "postfix@-.service" "the postfix@- unit name must not be masked"
+assert_not_contains "$(cat "$report")" "p***@-.service" "the postfix@- unit name must not look like an address"
+assert_contains "$(cat "$report")" "g***@tty1.service" "alphanumeric unit instances are still masked"
+assert_not_contains "$(cat "$report")" "getty@tty1.service" "alphanumeric unit instances must not leak in full"
 
 finish

@@ -66,8 +66,11 @@ mock_reset() {
     export MOCK_RELOAD_FAIL=0
     export MOCK_APT_FAIL=0
     export MOCK_SYSTEMCTL_FAIL=0
+    export MOCK_SYSTEMCTL_START_FAIL=""
     export MOCK_CORRUPT_ASSET=0
     export MOCK_GH_RATE_LIMIT=0
+    export MOCK_POSTCONF_UNCONFIGURED=0
+    export MOCK_POSTCONF_COMPAT=3.6
 }
 
 mock_calls_contain() { grep -qF -- "$1" "$MOCK_DIR/calls.log"; }
@@ -238,10 +241,35 @@ postmap() {
 postconf() {
     mock_log "postconf $*"
     local state="$MOCK_DIR/postconf.state"
-    case "${1:-}" in
-        -e)
-            local kv key val
-            kv=${2:-}
+    local compat="${MOCK_POSTCONF_COMPAT:-3.6}"
+    local default=0 short=0 mode="" param="" kv="" value=""
+    local -a positional=()
+
+    while (( $# > 0 )); do
+        case "$1" in
+            -e) mode=e; kv=${2:-}; shift 2 ;;
+            -n) mode=n; shift ;;
+            -M) mode=M; shift ;;
+            -d) default=1; shift ;;
+            -h) short=1; shift ;;
+            -c) shift 2 ;;
+            *) positional+=("$1"); shift ;;
+        esac
+    done
+    param=${positional[0]:-}
+
+    # Mimic a postfix package installed with "No configuration": main.cf does
+    # not exist, so reading a value fails and the built-in default is 0. The
+    # installer restores main.cf, after which postconf works normally again.
+    if [[ "${MOCK_POSTCONF_UNCONFIGURED:-0}" == "1" && -z "$mode" \
+          && ! -f "${MXB_POSTFIX_ETC:-/etc/postfix}/main.cf" ]]; then
+        compat=0
+        (( default == 1 )) || return 1
+    fi
+
+    case "$mode" in
+        e)
+            local key val
             key=$(printf '%s' "$kv" | awk -F'=' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1}')
             val=$(printf '%s' "$kv" | awk -F'=' '{sub(/^[^=]*=/, ""); gsub(/^[ \t]+|[ \t]+$/, "", $0); print}')
             touch "$state"
@@ -251,24 +279,37 @@ postconf() {
                 END { if (!done) print k " = " v }
             ' "$state" >"$state.tmp"
             mv "$state.tmp" "$state"
+            return 0
             ;;
-        -h)
-            awk -F' = ' -v k="${2:-}" '$1 == k { sub(/^[^=]*= */, ""); print; exit }' "$state"
-            ;;
-        -d)
-            case "${2:-}" in
-                compatibility_level) printf 'compatibility_level = 3.6\n' ;;
-                mail_version) printf 'mail_version = 3.8.6\n' ;;
-                *) printf '%s = \n' "${2:-}" ;;
-            esac
-            ;;
-        -n) cat "$state" ;;
-        -M)
+        n) cat "$state"; return 0 ;;
+        M)
             printf 'smtp      inet  n       -       y       -       -       smtpd\n'
             printf 'pickup    unix  n       -       y       60      1       pickup\n'
+            return 0
             ;;
-        *) return 0 ;;
     esac
+
+    if (( default == 1 )); then
+        case "$param" in
+            compatibility_level) value=$compat ;;
+            mail_version) value="3.8.6" ;;
+            "") return 0 ;;
+            *) value="" ;;
+        esac
+        if (( short == 1 )); then
+            printf '%s\n' "$value"
+        else
+            printf '%s = %s\n' "$param" "$value"
+        fi
+        return 0
+    fi
+
+    if (( short == 1 )); then
+        [[ -z "$param" ]] && return 0
+        awk -F' = ' -v k="$param" '$1 == k { sub(/^[^=]*= */, ""); print; exit }' "$state"
+        return 0
+    fi
+    return 0
 }
 
 postfix() {
@@ -311,6 +352,10 @@ systemctl() {
         daemon-reload) return 0 ;;
         enable|start)
             unit=${!#}
+            if [[ "$cmd" == "start" && -n "${MOCK_SYSTEMCTL_START_FAIL:-}" \
+                && "$unit" == "$MOCK_SYSTEMCTL_START_FAIL" ]]; then
+                return 1
+            fi
             if [[ "$cmd" == "enable" ]]; then
                 mock_set_unit_state "$unit" enabled
             else
@@ -363,7 +408,18 @@ timedatectl() { mock_log "timedatectl $*"; printf 'System clock synchronized: ye
 
 openssl() {
     mock_log "openssl $*"
-    printf 'subject=CN = mail.example.com\nissuer=C = US, O = Test CA, CN = Test CA\nnotBefore=Jan  1 00:00:00 2026 GMT\nnotAfter=Apr  1 00:00:00 2026 GMT\n'
+    case "$*" in
+        *s_client*)
+            printf 'CONNECTED(00000003)\n'
+            printf -- '-----BEGIN CERTIFICATE-----\nMIIBmockCertificate\n-----END CERTIFICATE-----\n'
+            ;;
+        *)
+            printf 'subject=CN = mail.example.com\n'
+            printf 'issuer=C = US, O = Test CA, CN = Test CA\n'
+            printf 'notBefore=Jan  1 00:00:00 2026 GMT\n'
+            printf 'notAfter=Apr  1 00:00:00 2026 GMT\n'
+            ;;
+    esac
 }
 
 getent() { mock_log "getent $*"; printf '203.0.113.10    mail.example.com\n'; }

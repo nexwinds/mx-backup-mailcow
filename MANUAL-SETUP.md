@@ -106,17 +106,30 @@ for f in /opt/mx-backup-mailcow/bin/*.sh; do bash -n "$f" || echo "FAIL $f"; don
 
 ## Step 5 — Postfix
 
+If the postfix package was installed with the "No configuration" mailer type,
+it prints `Postfix (main.cf) was not set up` and `/etc/postfix/main.cf` does not
+exist. Restore the package templates first, otherwise every `postconf` command
+below fails:
+
+```bash
+test -e /etc/postfix/main.cf || sudo cp /usr/share/postfix/main.cf.debian /etc/postfix/main.cf
+test -e /etc/postfix/master.cf || sudo cp /usr/share/postfix/master.cf.dist /etc/postfix/master.cf
+```
+
 Back up the original configuration once:
 
 ```bash
 sudo cp -p /etc/postfix/main.cf /etc/postfix/main.cf.pre-mx-backup-mailcow
 ```
 
-Apply the settings. `compatibility_level` should stay at the value Postfix
-itself reports:
+Apply the settings. A `compatibility_level` below `2` selects Postfix's
+backwards-compatible legacy defaults (Postfix reports the compiled-in default
+`0` when `main.cf` does not set one), so the snippet below raises it to `3.6`:
 
 ```bash
-sudo postconf -e "compatibility_level = $(postconf -d compatibility_level | awk '{print $3}')"
+compat=$(postconf -h compatibility_level 2>/dev/null || true)
+[[ "$compat" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( ${compat%%.*} >= 2 )) || compat=3.6
+sudo postconf -e "compatibility_level = $compat"
 ```
 
 Then, replacing the placeholders (`mx2.example.com`, `example.com`,

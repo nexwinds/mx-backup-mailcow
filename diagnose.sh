@@ -107,7 +107,9 @@ load_config() {
 # Sanitisation
 # ---------------------------------------------------------------------------
 mask_addresses() {
-    sed -E 's/([[:alnum:]._%+-])[[:alnum:]._%+-]*@/\1***@/g'
+    # Only mask things that look like mail addresses: a domain must follow the
+    # "@", so systemd unit names such as postfix@-.service stay readable.
+    sed -E 's/([[:alnum:]._%+-])[[:alnum:]._%+-]*@([[:alnum:]]|\[)/\1***@\2/g'
 }
 
 strip_private_keys() {
@@ -368,13 +370,13 @@ section_connectivity() {
     h3 "Configuration summary"
     banner
     if [[ "$CONFIG_LOADED" -eq 1 ]]; then
-        printf 'mailcow_host: %s\n' "$MAILCOW_HOST"
-        printf 'primary_ip: %s\n' "$MAILCOW_PRIMARY_IP"
-        printf 'primary_port: %s\n' "$MAILCOW_PRIMARY_PORT"
-        printf 'api_key_configured: %s\n' "$([[ -n "$MAILCOW_API_KEY" ]] && printf yes || printf no)"
-        printf 'api_ca_file: %s\n' "${MAILCOW_API_CA_FILE:-none}"
+        printf 'mailcow_host: %s\n' "$MAILCOW_HOST" >>"$REPORT"
+        printf 'primary_ip: %s\n' "$MAILCOW_PRIMARY_IP" >>"$REPORT"
+        printf 'primary_port: %s\n' "$MAILCOW_PRIMARY_PORT" >>"$REPORT"
+        printf 'api_key_configured: %s\n' "$([[ -n "$MAILCOW_API_KEY" ]] && printf yes || printf no)" >>"$REPORT"
+        printf 'api_ca_file: %s\n' "${MAILCOW_API_CA_FILE:-none}" >>"$REPORT"
     else
-        printf 'configuration not readable: %s\n' "$MXB_CONFIG_FILE"
+        printf 'configuration not readable: %s\n' "$MXB_CONFIG_FILE" >>"$REPORT"
     fi
     printf '~~~\n' >>"$REPORT"
 
@@ -398,9 +400,11 @@ section_connectivity() {
         printf '~~~\n' >>"$REPORT"
     fi
 
-    if [[ -n "$MAILCOW_HOST" ]] && have openssl && have timeout; then
-        run_shell_block "HTTPS certificate" \
-            "echo | timeout 10 openssl s_client -connect '$MAILCOW_HOST:443' -servername '$MAILCOW_HOST' 2>/dev/null | openssl x509 -noout -subject -issuer -dates 2>&1 || true"
+    if [[ -n "$MAILCOW_HOST" ]] && have openssl; then
+        h3 "HTTPS certificate"
+        banner
+        certificate_block "$MAILCOW_HOST" | sanitize >>"$REPORT"
+        printf '~~~\n' >>"$REPORT"
     fi
 
     if [[ -n "$MAILCOW_PRIMARY_IP" ]]; then
@@ -444,6 +448,26 @@ smtp_probe() {
     return 0
 }
 
+certificate_block() {
+    local host=$1 out="$TMP_DIR/tls.txt" cert="$TMP_DIR/tls.pem"
+    if ! have timeout; then
+        printf 'timeout not available; cannot probe TLS\n'
+        return 0
+    fi
+    timeout 15 openssl s_client -connect "$host:443" -servername "$host" \
+        </dev/null >"$out" 2>&1 || true
+    sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' \
+        "$out" >"$cert" 2>/dev/null || true
+    if [[ -s "$cert" ]]; then
+        openssl x509 -noout -subject -issuer -dates -in "$cert" 2>&1 || true
+        return 0
+    fi
+    printf 'no certificate received from %s:443\n' "$host"
+    # Surface the TLS error instead of leaving an unexplained empty result.
+    grep -aiE 'connect|error|fail|unable|timeout|refused' "$out" 2>/dev/null \
+        | head -n 5 || true
+}
+
 section_security() {
     h2 "5. Security posture"
     h3 "File permissions"
@@ -451,9 +475,9 @@ section_security() {
     local path
     for path in "$MXB_CONFIG_FILE" "$MXB_ETC" "$MXB_MAPS_DIR" "$MXB_STATE_DIR" "$MXB_INSTALL_DIR"; do
         if [[ -e "$path" ]]; then
-            stat -c '%a %U:%G %n' "$path" 2>/dev/null || printf '? %s\n' "$path"
+            stat -c '%a %U:%G %n' "$path" 2>/dev/null >>"$REPORT" || printf '? %s\n' "$path" >>"$REPORT"
         else
-            printf 'missing %s\n' "$path"
+            printf 'missing %s\n' "$path" >>"$REPORT"
         fi
     done
     printf '~~~\n' >>"$REPORT"
@@ -467,15 +491,15 @@ section_updates() {
     h2 "6. Application version and updates"
     h3 "Installed application"
     banner
-    printf 'installed_version: %s\n' "$VERSION"
+    printf 'installed_version: %s\n' "$VERSION" >>"$REPORT"
     if [[ -r "$MXB_INSTALL_DIR/VERSION" ]]; then
-        printf 'install_dir_version: %s\n' "$(<"$MXB_INSTALL_DIR/VERSION")"
+        printf 'install_dir_version: %s\n' "$(<"$MXB_INSTALL_DIR/VERSION")" >>"$REPORT"
     fi
     if [[ -r "$MXB_INSTALL_DIR/SHA256SUMS" ]] && have sha256sum; then
         if ( cd "$MXB_INSTALL_DIR" && sha256sum -c SHA256SUMS --quiet 2>&1 ); then
-            printf 'file_integrity: ok\n'
+            printf 'file_integrity: ok\n' >>"$REPORT"
         else
-            printf 'file_integrity: mismatch or missing files\n'
+            printf 'file_integrity: mismatch or missing files\n' >>"$REPORT"
         fi
     fi
     printf '~~~\n' >>"$REPORT"

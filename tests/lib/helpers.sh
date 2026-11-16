@@ -147,6 +147,7 @@ sandbox_init() {
     export MXB_SYSTEMD_DIR="$TEST_TMP/systemd"
     export MXB_LOGROTATE_DIR="$TEST_TMP/logrotate"
     export MXB_POSTFIX_ETC="$TEST_TMP/postfix-etc"
+    export MXB_POSTFIX_TEMPLATE_DIR="$TEST_TMP/postfix-templates"
     export MXB_SSH_DIR="$TEST_TMP/ssh"
     export MXB_CA_BUNDLE="$TEST_TMP/ca-certificates.crt"
 
@@ -158,8 +159,18 @@ sandbox_init() {
 
     mkdir -p "$MXB_ETC" "$MXB_MAPS_DIR" "$MXB_STATE_DIR" "$MXB_LOG_DIR" \
         "$MXB_BACKUP_DIR" "$MOCK_DIR" "$MOCK_FIXTURES" "$MXB_BIN_DIR" "$TEST_TMP/bin" \
-        "$MXB_SYSTEMD_DIR" "$MXB_LOGROTATE_DIR" "$MXB_POSTFIX_ETC" "$MXB_SSH_DIR"
+        "$MXB_SYSTEMD_DIR" "$MXB_LOGROTATE_DIR" "$MXB_POSTFIX_ETC" \
+        "$MXB_POSTFIX_TEMPLATE_DIR" "$MXB_SSH_DIR"
     printf 'Port 22\n' >"$MXB_SSH_DIR/sshd_config"
+    cat >"$MXB_POSTFIX_TEMPLATE_DIR/main.cf.debian" <<'EOF'
+# Postfix package template (test fixture)
+smtpd_banner = $myhostname ESMTP $mail_name (Ubuntu)
+compatibility_level = 3.6
+EOF
+    cat >"$MXB_POSTFIX_TEMPLATE_DIR/master.cf.dist" <<'EOF'
+smtp      inet  n       -       y       -       -       smtpd
+pickup    unix  n       -       y       60      1       pickup
+EOF
     printf -- '-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----\n' >"$MXB_CA_BUNDLE"
     printf 'ID=ubuntu\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\n' >"$MXB_OS_RELEASE"
     : >"$MOCK_JOURNAL"

@@ -66,7 +66,14 @@ map seed files are in
 - queue lifetime, backoff, warning delay and size limits;
 - TLS security level, protocols and CA bundle.
 
-The original `main.cf` is kept once as `main.cf.pre-mx-backup-mailcow`.
+The original `main.cf` is kept once as `main.cf.pre-mx-backup-mailcow`. When
+the postfix package was installed with the "No configuration" mailer type and
+ships no `/etc/postfix/main.cf` or `master.cf`, the installer restores both from
+the package templates (`/usr/share/postfix/main.cf.debian` and
+`master.cf.dist`) before writing any setting. A `compatibility_level` below `2`
+is raised to `3.6`: levels `0` and `1` select Postfix's backwards-compatible
+legacy defaults, which this configuration does not intend (Postfix reports the
+compiled-in default `0` when `main.cf` does not set one).
 
 ## Scripts and flags
 
