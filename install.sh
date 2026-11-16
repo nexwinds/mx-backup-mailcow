@@ -16,6 +16,7 @@ REPO="nexwinds/mx-backup-mailcow"
 GH_API="https://api.github.com/repos/${REPO}/releases"
 GH_DL="https://github.com/${REPO}/releases/download"
 RE_DOMAIN='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9]([a-z0-9-]{0,57}[a-z0-9])?)$'
+RE_EMAIL='^[A-Za-z0-9._%+-]+@([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9]([a-z0-9-]{0,57}[a-z0-9])?)$'
 PROG_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 : "${MXB_ETC:=/etc/mailcow-backup-mx}"
@@ -33,8 +34,11 @@ PROG_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 : "${MXB_POSTFIX_TEMPLATE_DIR:=/usr/share/postfix}"
 : "${MXB_SSH_DIR:=/etc/ssh}"
 : "${MXB_CA_BUNDLE:=/etc/ssl/certs/ca-certificates.crt}"
+: "${MXB_LETSENCRYPT_DIR:=/etc/letsencrypt}"
+: "${MXB_RENEWAL_HOOK_DIR:=$MXB_LETSENCRYPT_DIR/renewal-hooks/deploy}"
 
 MANAGED_KEYS=(
+    BACKUP_MX_HOSTNAME
     MAILCOW_HOST
     MAILCOW_API_KEY
     MAILCOW_API_CA_FILE
@@ -42,6 +46,9 @@ MANAGED_KEYS=(
     MAILCOW_PRIMARY_PORT
     SMTP_TLS_MODE
     SMTP_TLS_MATCH_HOSTNAME
+    SMTPD_TLS_CERT_FILE
+    SMTPD_TLS_KEY_FILE
+    OPERATIONAL_MAIL_TO
     EXCLUDE_DOMAINS
     RELAX_AFTER_DAYS
     QUEUE_LIFETIME
@@ -66,6 +73,13 @@ ARG_KEY=""
 ARG_CA=""
 ARG_TLS_MODE=""
 ARG_TLS_MATCH=""
+ARG_MX_HOSTNAME=""
+ARG_OPERATIONAL_MAIL=""
+ARG_TLS_CERT=""
+ARG_TLS_KEY=""
+ARG_NO_INBOUND_TLS=0
+
+DETECTED_FQDN=""
 
 WORK_DIR=""
 RELEASE_ROOT=""
@@ -92,8 +106,18 @@ Connection options:
   --api-key KEY             Mailcow read-only API key (prefer --api-key-stdin)
   --api-key-stdin           Read the API key from standard input
   --ca-file PATH            Private CA bundle used to verify the Mailcow API
-  --smtp-tls-mode MODE      may (default) or secure
+  --smtp-tls-mode MODE      secure (default) or may (unverified TLS)
   --tls-match HOSTNAME      Certificate hostname for SMTP_TLS_MODE=secure
+                            (defaults to MAILCOW_HOST)
+  --hostname FQDN           Postfix identity for this server (default: hostname -f)
+
+Inbound TLS and operational mail:
+  --inbound-tls-cert PATH   Certificate chain offered to inbound MTAs
+  --inbound-tls-key PATH    Private key for --inbound-tls-cert
+                            (both default to /etc/letsencrypt/live/<hostname>/)
+  --no-inbound-tls          Do not offer STARTTLS on port 25
+  --operational-mail ADDR   Forward root/postmaster/abuse mail here
+                            (default: discard, this server stores no mail)
 
 Source options:
   --release VERSION         Install a specific release (default: latest)
@@ -169,15 +193,38 @@ check_os() {
     fi
 }
 
-check_hostname() {
-    local fqdn
+detect_fqdn() {
+    local fqdn=""
     fqdn=$(hostname -f 2>/dev/null || true)
-    [[ -z "$fqdn" ]] && fqdn=$(hostname 2>/dev/null || true)
-    if [[ "$fqdn" != *.* ]]; then
-        warn "the server hostname '$fqdn' is not fully qualified; set a FQDN with 'hostnamectl set-hostname'"
-    fi
-    BACKUP_MX_HOSTNAME=$fqdn
+    [[ -n "$fqdn" ]] || fqdn=$(hostname 2>/dev/null || true)
+    printf '%s' "${fqdn,,}"
 }
+
+# Postfix derives $myorigin, the HELO name and the DSN sender domain from
+# $myhostname, which must be a fully qualified domain name. A single-label
+# hostname makes receivers reject the HELO, puts an unverifiable domain in
+# every bounce, and prevents issuing a certificate for inbound TLS.
+check_hostname() {
+    local fqdn=${DETECTED_FQDN:-} candidate
+    if [[ -z "$fqdn" ]]; then
+        fqdn=$(detect_fqdn)
+        DETECTED_FQDN=$fqdn
+    fi
+    candidate=${BACKUP_MX_HOSTNAME:-}
+    candidate=${candidate,,}
+    candidate=${candidate%.}
+    [[ "$candidate" =~ $RE_DOMAIN ]] && return 0
+
+    if [[ "$FORCE" -eq 1 ]]; then
+        warn "the Postfix hostname '${candidate:-unknown}' is not a fully qualified domain name; continuing due to --force. Postfix will use '${candidate:-unknown}' as its HELO and DSN domain, which receivers may reject."
+        return 0
+    fi
+    if [[ -n "$candidate" && "$candidate" != "$fqdn" ]]; then
+        die "the Postfix hostname '${candidate}' is not a fully qualified domain name; use --hostname mx.example.com or fix BACKUP_MX_HOSTNAME in $MXB_CONFIG_FILE"
+    fi
+    die "the server hostname '${fqdn:-unknown}' is not a fully qualified domain name ('hostname -f' must contain a dot); set it with 'hostnamectl set-hostname mx.example.com', add the name to /etc/hosts, or pass --hostname FQDN, then re-run"
+}
+
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -199,6 +246,11 @@ parse_args() {
             --ca-file) ARG_CA=${2:?}; shift ;;
             --smtp-tls-mode) ARG_TLS_MODE=${2:?}; shift ;;
             --tls-match) ARG_TLS_MATCH=${2:?}; shift ;;
+            --hostname) ARG_MX_HOSTNAME=${2:?--hostname requires a FQDN}; shift ;;
+            --operational-mail) ARG_OPERATIONAL_MAIL=${2:?--operational-mail requires an address}; shift ;;
+            --inbound-tls-cert) ARG_TLS_CERT=${2:?--inbound-tls-cert requires a path}; shift ;;
+            --inbound-tls-key) ARG_TLS_KEY=${2:?--inbound-tls-key requires a path}; shift ;;
+            --no-inbound-tls) ARG_NO_INBOUND_TLS=1 ;;
             -h|--help) usage; exit 0 ;;
             -V|--version) printf '%s %s\n' "$SCRIPT_NAME" "$VERSION"; exit 0 ;;
             *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
@@ -211,13 +263,20 @@ parse_args() {
 # Configuration
 # ---------------------------------------------------------------------------
 load_existing_config() {
+    # The Postfix identity is the system FQDN unless the operator overrides it.
+    BACKUP_MX_HOSTNAME=${DETECTED_FQDN:-}
     MAILCOW_HOST=""
     MAILCOW_API_KEY=""
     MAILCOW_API_CA_FILE=""
     MAILCOW_PRIMARY_IP=""
     MAILCOW_PRIMARY_PORT="25"
-    SMTP_TLS_MODE="may"
+    # Authenticated TLS to the primary is the safe default: a policy of "may"
+    # accepts any certificate (or none) on the hop that carries all queued mail.
+    SMTP_TLS_MODE="secure"
     SMTP_TLS_MATCH_HOSTNAME=""
+    SMTPD_TLS_CERT_FILE=""
+    SMTPD_TLS_KEY_FILE=""
+    OPERATIONAL_MAIL_TO=""
     # shellcheck disable=SC2034  # persisted to the configuration file
     EXCLUDE_DOMAINS=""
     RELAX_AFTER_DAYS="7"
@@ -244,10 +303,35 @@ load_existing_config() {
     [[ -n "$ARG_CA" ]] && MAILCOW_API_CA_FILE=$ARG_CA
     [[ -n "$ARG_TLS_MODE" ]] && SMTP_TLS_MODE=$ARG_TLS_MODE
     [[ -n "$ARG_TLS_MATCH" ]] && SMTP_TLS_MATCH_HOSTNAME=$ARG_TLS_MATCH
+    [[ -n "$ARG_MX_HOSTNAME" ]] && BACKUP_MX_HOSTNAME=$ARG_MX_HOSTNAME
+    [[ -n "$ARG_OPERATIONAL_MAIL" ]] && OPERATIONAL_MAIL_TO=$ARG_OPERATIONAL_MAIL
+    [[ -n "$ARG_TLS_CERT" ]] && SMTPD_TLS_CERT_FILE=$ARG_TLS_CERT
+    [[ -n "$ARG_TLS_KEY" ]] && SMTPD_TLS_KEY_FILE=$ARG_TLS_KEY
 
     MAILCOW_HOST=${MAILCOW_HOST,,}
     MAILCOW_HOST=${MAILCOW_HOST%.}
     SMTP_TLS_MATCH_HOSTNAME=${SMTP_TLS_MATCH_HOSTNAME,,}
+    SMTP_TLS_MATCH_HOSTNAME=${SMTP_TLS_MATCH_HOSTNAME%.}
+    BACKUP_MX_HOSTNAME=${BACKUP_MX_HOSTNAME,,}
+    BACKUP_MX_HOSTNAME=${BACKUP_MX_HOSTNAME%.}
+
+    # An explicit --no-inbound-tls must win over a certificate left in the
+    # configuration file, otherwise STARTTLS stays on against the operator.
+    if [[ "$ARG_NO_INBOUND_TLS" -eq 1 ]]; then
+        SMTPD_TLS_CERT_FILE=""
+        SMTPD_TLS_KEY_FILE=""
+    fi
+
+    # Use a Let's Encrypt certificate for the backup MX host when one exists.
+    if [[ "$ARG_NO_INBOUND_TLS" -eq 0 && -n "$BACKUP_MX_HOSTNAME" \
+        && -z "$SMTPD_TLS_CERT_FILE" && -z "$SMTPD_TLS_KEY_FILE" ]]; then
+        local lesite="$MXB_LETSENCRYPT_DIR/live/$BACKUP_MX_HOSTNAME"
+        if [[ -r "$lesite/fullchain.pem" && -r "$lesite/privkey.pem" ]]; then
+            SMTPD_TLS_CERT_FILE="$lesite/fullchain.pem"
+            SMTPD_TLS_KEY_FILE="$lesite/privkey.pem"
+            log "using inbound TLS certificate $lesite/fullchain.pem"
+        fi
+    fi
 }
 
 prompt() {
@@ -274,14 +358,22 @@ interactive_config() {
     [[ "$NON_INTERACTIVE" -eq 1 ]] && return 0
     printf '\nMailcow Backup MX configuration\n'
     printf 'Press Enter to accept the value in brackets.\n\n'
+    prompt BACKUP_MX_HOSTNAME "Postfix hostname for this server (FQDN)"
     prompt MAILCOW_HOST "Mailcow hostname (API endpoint)"
     prompt MAILCOW_PRIMARY_IP "Primary Mailcow IP address"
     prompt MAILCOW_API_KEY "Read-only API key" 1
     prompt MAILCOW_API_CA_FILE "Private CA file for the API (optional)"
-    prompt SMTP_TLS_MODE "SMTP TLS mode for the primary (may/secure)"
+    prompt SMTPD_TLS_CERT_FILE "Inbound TLS certificate chain (blank: no STARTTLS)"
+    prompt SMTPD_TLS_KEY_FILE "Inbound TLS private key"
+    prompt OPERATIONAL_MAIL_TO "Forward root/postmaster mail to (blank: discard)"
+    prompt SMTP_TLS_MODE "SMTP TLS mode for the primary (secure/may)"
 }
 
 validate_config() {
+    MAILCOW_HOST=${MAILCOW_HOST,,}
+    MAILCOW_HOST=${MAILCOW_HOST%.}
+    BACKUP_MX_HOSTNAME=${BACKUP_MX_HOSTNAME,,}
+    BACKUP_MX_HOSTNAME=${BACKUP_MX_HOSTNAME%.}
     [[ -n "$MAILCOW_HOST" ]] || die "MAILCOW_HOST is required (use --mailcow-host or --non-interactive with --config)"
     [[ -n "$MAILCOW_PRIMARY_IP" ]] || die "MAILCOW_PRIMARY_IP is required (use --primary-ip or --non-interactive with --config)"
     [[ -n "$MAILCOW_API_KEY" ]] || die "MAILCOW_API_KEY is required (use --api-key-stdin or --config)"
@@ -290,6 +382,23 @@ validate_config() {
         || die "MAILCOW_HOST is not a valid hostname: $MAILCOW_HOST"
     [[ "$MAILCOW_API_KEY" =~ ^[A-Za-z0-9-]+$ ]] || die "MAILCOW_API_KEY contains unexpected characters"
     (( ${#MAILCOW_API_KEY} >= 16 )) || die "MAILCOW_API_KEY is too short"
+
+    if [[ "$BACKUP_MX_HOSTNAME" =~ $RE_DOMAIN ]]; then
+        :
+    elif [[ "$FORCE" -eq 1 ]]; then
+        warn "the Postfix hostname '${BACKUP_MX_HOSTNAME:-unknown}' is not a fully qualified domain name; continuing due to --force. HELO checks, DSN SPF/DMARC validation and inbound TLS will fail for this identity."
+    else
+        die "the Postfix hostname '${BACKUP_MX_HOSTNAME:-unknown}' is not a fully qualified domain name; use --hostname mx.example.com"
+    fi
+    if [[ -n "$DETECTED_FQDN" && "$BACKUP_MX_HOSTNAME" != "$DETECTED_FQDN" ]]; then
+        warn "Postfix will identify itself as $BACKUP_MX_HOSTNAME, which differs from the system hostname $DETECTED_FQDN; point the DNS A/AAAA and PTR of $BACKUP_MX_HOSTNAME at this server"
+    fi
+
+    if [[ -n "$OPERATIONAL_MAIL_TO" ]]; then
+        OPERATIONAL_MAIL_TO=${OPERATIONAL_MAIL_TO,,}
+        [[ "$OPERATIONAL_MAIL_TO" =~ $RE_EMAIL ]] \
+            || die "OPERATIONAL_MAIL_TO is not a valid address: $OPERATIONAL_MAIL_TO"
+    fi
 
     local o
     if [[ "$MAILCOW_PRIMARY_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -307,14 +416,46 @@ validate_config() {
     (( MAILCOW_PRIMARY_PORT >= 1 && MAILCOW_PRIMARY_PORT <= 65535 )) \
         || die "MAILCOW_PRIMARY_PORT is out of range"
 
+    # The primary's certificate is issued for MAILCOW_HOST; requiring that name
+    # is the only useful default, and an empty name would silently disable it.
+    # Derive it here, after interactive_config, so the prompted host is used.
+    if [[ "$SMTP_TLS_MODE" == "secure" && -z "$SMTP_TLS_MATCH_HOSTNAME" ]]; then
+        SMTP_TLS_MATCH_HOSTNAME=$MAILCOW_HOST
+    fi
+    SMTP_TLS_MATCH_HOSTNAME=${SMTP_TLS_MATCH_HOSTNAME,,}
+    SMTP_TLS_MATCH_HOSTNAME=${SMTP_TLS_MATCH_HOSTNAME%.}
+
     case "$SMTP_TLS_MODE" in
         may) ;;
         secure)
             [[ "$SMTP_TLS_MATCH_HOSTNAME" =~ $RE_DOMAIN ]] \
-                || die "SMTP_TLS_MODE=secure requires --tls-match HOSTNAME"
+                || die "SMTP_TLS_MODE=secure requires a certificate name (--tls-match or MAILCOW_HOST)"
             ;;
         *) die "SMTP_TLS_MODE must be 'may' or 'secure'" ;;
     esac
+
+    if [[ -z "$SMTPD_TLS_CERT_FILE" && -z "$SMTPD_TLS_KEY_FILE" ]]; then
+        SMTPD_TLS_CERT_FILE=""
+        SMTPD_TLS_KEY_FILE=""
+    else
+        [[ -n "$SMTPD_TLS_CERT_FILE" && -n "$SMTPD_TLS_KEY_FILE" ]] \
+            || die "inbound TLS needs both SMTPD_TLS_CERT_FILE and SMTPD_TLS_KEY_FILE (use --inbound-tls-cert and --inbound-tls-key)"
+        [[ -r "$SMTPD_TLS_CERT_FILE" ]] || die "inbound TLS certificate is not readable: $SMTPD_TLS_CERT_FILE"
+        [[ -r "$SMTPD_TLS_KEY_FILE" ]] || die "inbound TLS private key is not readable: $SMTPD_TLS_KEY_FILE"
+        if have openssl; then
+            local cert_pub key_pub
+            cert_pub=$(openssl x509 -in "$SMTPD_TLS_CERT_FILE" -noout -pubkey 2>/dev/null || true)
+            key_pub=$(openssl pkey -in "$SMTPD_TLS_KEY_FILE" -pubout 2>/dev/null || true)
+            [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] \
+                || die "the inbound TLS key does not match the certificate ($SMTPD_TLS_KEY_FILE / $SMTPD_TLS_CERT_FILE)"
+            openssl x509 -in "$SMTPD_TLS_CERT_FILE" -noout -checkhost "$BACKUP_MX_HOSTNAME" >/dev/null 2>&1 \
+                || die "the inbound TLS certificate does not cover $BACKUP_MX_HOSTNAME; use --no-inbound-tls to install without STARTTLS"
+            openssl x509 -in "$SMTPD_TLS_CERT_FILE" -noout -checkend 0 >/dev/null 2>&1 \
+                || die "the inbound TLS certificate has expired or is not yet valid: $SMTPD_TLS_CERT_FILE"
+        else
+            warn "openssl is not available; the inbound TLS certificate was not validated"
+        fi
+    fi
 
     [[ "$RELAX_AFTER_DAYS" =~ ^[0-9]+$ ]] || die "RELAX_AFTER_DAYS must be an integer"
     [[ "$QUEUE_LIFETIME" =~ ^[0-9]+[smhdw]$ ]] || die "QUEUE_LIFETIME must look like 7d"
@@ -461,13 +602,17 @@ prepare_local_tree() {
     else
         [[ -f "$dir/sync-mailcow.sh" ]] || die "--local-dir contains neither bin/sync-mailcow.sh nor sync-mailcow.sh"
         root="$WORK_DIR/mx-backup-mailcow-$VERSION"
-        mkdir -p "$root/bin" "$root/systemd" "$root/share/doc" "$root/config" "$root/logrotate"
+        mkdir -p "$root/bin" "$root/systemd" "$root/share/doc" "$root/share/mailcow" "$root/config" "$root/logrotate"
         cp -f "$dir"/sync-mailcow.sh "$dir"/update.sh "$dir"/diagnose.sh "$dir"/update-scripts.sh "$dir"/install.sh "$root/bin/"
         cp -f "$dir/VERSION" "$root/VERSION" 2>/dev/null || printf '%s\n' "$VERSION" >"$root/VERSION"
         [[ -d "$dir/systemd" ]] && cp -f "$dir/systemd"/* "$root/systemd/" 2>/dev/null || true
+        [[ -d "$dir/mailcow" ]] && cp -f "$dir/mailcow"/* "$root/share/mailcow/" 2>/dev/null || true
         [[ -d "$dir/config" ]] && cp -f "$dir/config"/* "$root/config/" 2>/dev/null || true
         [[ -d "$dir/logrotate" ]] && cp -f "$dir/logrotate"/* "$root/logrotate/" 2>/dev/null || true
         [[ -f "$dir/README.md" ]] && cp -f "$dir/README.md" "$root/share/doc/"
+        [[ -f "$dir/OPERATIONS.md" ]] && cp -f "$dir/OPERATIONS.md" "$root/share/doc/"
+        [[ -f "$dir/TROUBLESHOOTING.md" ]] && cp -f "$dir/TROUBLESHOOTING.md" "$root/share/doc/"
+        [[ -f "$dir/DOCS.md" ]] && cp -f "$dir/DOCS.md" "$root/share/doc/"
         [[ -f "$dir/CHANGELOG.md" ]] && cp -f "$dir/CHANGELOG.md" "$root/share/doc/"
         [[ -f "$dir/LICENSE" ]] && cp -f "$dir/LICENSE" "$root/share/doc/"
         chmod 0755 "$root/bin"/*.sh
@@ -578,6 +723,13 @@ install_application() {
         ensure_dir 0755 "$MXB_INSTALL_DIR/config"
         for file in "$RELEASE_ROOT"/config/*; do
             [[ -f "$file" ]] && install -m 0644 "$file" "$MXB_INSTALL_DIR/config/"
+        done
+    fi
+
+    if [[ -d "$RELEASE_ROOT/share/mailcow" ]]; then
+        ensure_dir 0755 "$MXB_INSTALL_DIR/share/mailcow"
+        for file in "$RELEASE_ROOT"/share/mailcow/*; do
+            [[ -f "$file" ]] && install -m 0755 "$file" "$MXB_INSTALL_DIR/share/mailcow/"
         done
     fi
 
@@ -693,6 +845,123 @@ postfix_compatibility_level() {
     printf '3.6'
 }
 
+# Postfix reads the TLS key as the unprivileged "postfix" user, so a Let's
+# Encrypt key (mode 0600 root and a 0700 parent directory) is unusable where it
+# lives. Stage the chain and key in a Postfix-readable directory, and install a
+# certbot deploy hook so renewals update the copies instead of leaving Postfix
+# with the expired certificate.
+provision_inbound_tls() {
+    local source_cert=${SMTPD_TLS_CERT_FILE:-} source_key=${SMTPD_TLS_KEY_FILE:-}
+    local dir="$MXB_POSTFIX_ETC/tls" group=postfix target_cert target_key
+
+    if [[ -z "$source_cert" ]]; then
+        local param
+        for param in smtpd_tls_cert_file smtpd_tls_key_file; do
+            if [[ -n "$(postconf -h "$param" 2>/dev/null || true)" ]]; then
+                postconf -X "$param" || die "cannot remove stale $param"
+                log "removed stale $param: inbound STARTTLS is disabled"
+            fi
+        done
+        SMTPD_TLS_CERT_FILE=""
+        SMTPD_TLS_KEY_FILE=""
+        return 0
+    fi
+
+    getent group postfix >/dev/null 2>&1 || group=root
+    mkdir -p "$dir"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        chown root:"$group" "$dir" || die "cannot set ownership of $dir"
+    fi
+    chmod 0750 "$dir"
+    target_cert="$dir/${BACKUP_MX_HOSTNAME}.crt"
+    target_key="$dir/${BACKUP_MX_HOSTNAME}.key"
+
+    if [[ "$(id -u)" -eq 0 ]]; then
+        install -m 0644 -o root -g "$group" "$source_cert" "$target_cert" \
+            || die "cannot stage the inbound TLS certificate"
+        install -m 0640 -o root -g "$group" "$source_key" "$target_key" \
+            || die "cannot stage the inbound TLS key"
+    else
+        install -m 0644 "$source_cert" "$target_cert" || die "cannot stage the inbound TLS certificate"
+        install -m 0640 "$source_key" "$target_key" || die "cannot stage the inbound TLS key"
+    fi
+
+    if have runuser && id -u postfix >/dev/null 2>&1; then
+        runuser -u postfix -- test -r "$target_cert" \
+            || die "the postfix user cannot read $target_cert"
+        runuser -u postfix -- test -r "$target_key" \
+            || die "the postfix user cannot read $target_key"
+    fi
+
+    SMTPD_TLS_CERT_FILE=$target_cert
+    SMTPD_TLS_KEY_FILE=$target_key
+    log "inbound TLS certificate staged in $dir"
+
+    case "$source_cert" in
+        "$MXB_LETSENCRYPT_DIR"/*) install_renewal_hook "$source_cert" "$source_key" "$group" ;;
+        *)
+            warn "inbound TLS material is not managed by certbot; renew $source_cert and re-run install.sh before it expires"
+            ;;
+    esac
+}
+
+install_renewal_hook() {
+    local source_cert=$1 source_key=$2 group=$3
+    local dir="$MXB_RENEWAL_HOOK_DIR" hook="$MXB_RENEWAL_HOOK_DIR/mx-backup-mailcow-tls"
+    local target_cert="$MXB_POSTFIX_ETC/tls/${BACKUP_MX_HOSTNAME}.crt"
+    local target_key="$MXB_POSTFIX_ETC/tls/${BACKUP_MX_HOSTNAME}.key"
+
+    install -d -m 0755 "$dir" || die "cannot create $dir"
+    cat >"$hook" <<EOF
+#!/bin/sh
+# Installed by mx-backup-mailcow: keep the Postfix copy of the certificate in
+# sync with the certbot renewal store.
+set -e
+install -m 0644 -o root -g $group "$source_cert" "$target_cert"
+install -m 0640 -o root -g $group "$source_key" "$target_key"
+postfix reload
+EOF
+    chmod 0755 "$hook"
+    log "installed certbot renewal hook $hook"
+}
+
+# A chrooted Postfix process resolves paths inside the queue directory, so a
+# map under /etc/postfix is invisible to it. Either the maps live in the jail
+# or the service must not be chrooted; the upstream default is the latter.
+ensure_map_visibility() {
+    local queue_dir jail_path service field
+    queue_dir=$(postconf -h queue_directory 2>/dev/null || true)
+    [[ -n "$queue_dir" ]] || queue_dir=$(postconf -d -h queue_directory 2>/dev/null || true)
+    if [[ -z "$queue_dir" ]]; then
+        warn "cannot determine Postfix queue_directory; the chroot/map visibility check was skipped"
+        return 0
+    fi
+    jail_path="${queue_dir%/}$MXB_MAPS_DIR"
+
+    for service in smtp/inet smtp/unix; do
+        field=$(postconf -F "${service}/chroot" 2>/dev/null || true)
+        [[ "$field" == *"=y" ]] || continue
+        if [[ -e "$jail_path/relay_recipients.db" ]]; then
+            log "$service runs chrooted and the maps are visible inside $queue_dir"
+            continue
+        fi
+        postconf -F "${service}/chroot=n" \
+            || die "cannot disable chroot for $service"
+        log "disabled chroot for $service: it must read $MXB_MAPS_DIR, which is not inside $queue_dir"
+    done
+}
+
+# These services deliver locally or run external commands; a backup MX uses
+# neither, so remove the entries instead of leaving unused mail paths behind.
+prune_unused_services() {
+    local entry
+    for entry in uucp/unix lmtp/unix virtual/unix; do
+        [[ -n "$(postconf -M "$entry" 2>/dev/null || true)" ]] || continue
+        postconf -MX "$entry" || die "cannot remove the unused $entry service"
+        log "removed the unused $entry service from master.cf"
+    done
+}
+
 configure_postfix() {
     local maps="$MXB_MAPS_DIR" compat
     local -a settings=()
@@ -706,9 +975,11 @@ configure_postfix() {
     compat=$(postfix_compatibility_level "$MXB_POSTFIX_ETC/main.cf")
     log "using Postfix compatibility_level $compat"
 
+    provision_inbound_tls
+
     settings=(
         "compatibility_level = $compat"
-        "myhostname = ${BACKUP_MX_HOSTNAME:-localhost}"
+        "myhostname = $BACKUP_MX_HOSTNAME"
         "mydomain = ${BACKUP_MX_HOSTNAME#*.}"
         "myorigin = \$myhostname"
         "mydestination = localhost, localhost.localdomain"
@@ -737,6 +1008,7 @@ configure_postfix() {
         "smtpd_helo_required = yes"
         "smtpd_reject_unlisted_recipient = yes"
         "smtpd_forbid_bare_newline = yes"
+        "smtpd_forbid_unauth_pipelining = yes"
         "smtpd_data_restrictions = reject_unauth_pipelining"
         "disable_vrfy_command = yes"
         "smtpd_sasl_auth_enable = no"
@@ -759,6 +1031,15 @@ configure_postfix() {
         "smtp_tls_loglevel = 1"
         "smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt"
     )
+    if [[ -n "$SMTPD_TLS_CERT_FILE" ]]; then
+        settings+=(
+            "smtpd_tls_cert_file = $SMTPD_TLS_CERT_FILE"
+            "smtpd_tls_key_file = $SMTPD_TLS_KEY_FILE"
+        )
+        log "inbound STARTTLS enabled with $SMTPD_TLS_CERT_FILE"
+    else
+        warn "inbound STARTTLS is disabled (no certificate): senders that enforce MTA-STS or DANE cannot deliver to this MX. Obtain a certificate for $BACKUP_MX_HOSTNAME and re-run install.sh"
+    fi
 
     local item
     for item in "${settings[@]}"; do
@@ -768,21 +1049,33 @@ configure_postfix() {
     [[ -s "$MXB_POSTFIX_ETC/main.cf" ]] \
         || die "Postfix main.cf is missing after configuration"
 
-    # Local operational mail is discarded: this server never stores mail.
-    cat >"$maps/aliases" <<'EOF'
-# Managed by mx-backup-mailcow: local operational mail is discarded.
-postmaster: /dev/null
-root: /dev/null
-mailer-daemon: /dev/null
-double-bounce: /dev/null
-nobody: /dev/null
-hostmaster: /dev/null
-webmaster: /dev/null
-abuse: /dev/null
-security: /dev/null
+    ensure_map_visibility
+    prune_unused_services
+
+    # Local operational mail either goes to the operator or (by explicit
+    # default) nowhere: this server never stores mail.
+    local mail_target=${OPERATIONAL_MAIL_TO:-/dev/null} alias_comment
+    if [[ -n "$OPERATIONAL_MAIL_TO" ]]; then
+        alias_comment="local operational mail is forwarded to $OPERATIONAL_MAIL_TO"
+    else
+        alias_comment="local operational mail is discarded (set OPERATIONAL_MAIL_TO to receive it)"
+    fi
+    cat >"$maps/aliases" <<EOF
+# Managed by mx-backup-mailcow: $alias_comment.
+postmaster: $mail_target
+root: $mail_target
+mailer-daemon: $mail_target
+double-bounce: $mail_target
+nobody: $mail_target
+hostmaster: $mail_target
+webmaster: $mail_target
+abuse: $mail_target
+security: $mail_target
 EOF
     chmod 0644 "$maps/aliases"
-    postmap "hash:$maps/aliases" || die "postmap failed for the local aliases map"
+    have postalias || die "postalias is missing from the postfix package; reinstall postfix"
+    postalias "hash:$maps/aliases" || die "postalias failed for the local aliases map"
+    log "operational mail aliases written ($alias_comment)"
 
     # Seed empty maps so that Postfix can start before the first sync.
     local name
@@ -857,6 +1150,160 @@ configure_firewall() {
     log "firewall configured (SSH: ${ports[*]}, SMTP: 25)"
 }
 
+# TLS validity, queue lifetimes and log correlation all depend on an accurate
+# clock. systemd-timesyncd synchronises shortly after boot; wait for that
+# bounded event instead of proceeding with a clock that may jump later.
+require_clock_sync() {
+    local deadline=${MXB_CLOCK_WAIT_SECONDS:-30} waited=0 state=""
+    if [[ "${MXB_SKIP_CLOCK_CHECK:-0}" == "1" ]]; then
+        log "skipping the clock check (MXB_SKIP_CLOCK_CHECK=1)"
+        return 0
+    fi
+    if ! have timedatectl; then
+        warn "timedatectl is not available; the clock synchronization state could not be verified"
+        return 0
+    fi
+    while :; do
+        state=$(timedatectl show -p NTPSynchronized --value 2>/dev/null | tr -d '[:space:]' || true)
+        [[ "$state" == "yes" ]] && break
+        (( waited >= deadline )) && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if [[ "$state" == "yes" ]]; then
+        log "system clock is synchronized"
+        return 0
+    fi
+    if [[ "$FORCE" -eq 1 ]]; then
+        warn "the system clock is not synchronized; continuing due to --force. Certificate validation, queue lifetimes and log timestamps will be unreliable."
+        return 0
+    fi
+    die "the system clock is not synchronized after ${deadline}s (state: ${state:-unknown}); check 'timedatectl timesync-status' and 'systemctl status systemd-timesyncd', then re-run"
+}
+
+# The forward hop carries all queued mail; with SMTP_TLS_MODE=secure it must
+# verify, and with "may" the operator must know it does not.
+verify_primary_smtp_tls() {
+    local name=${SMTP_TLS_MATCH_HOSTNAME:-$MAILCOW_HOST} out="" rc=0 reason="" target
+    if [[ "$MAILCOW_PRIMARY_IP" == *:* ]]; then
+        target="[$MAILCOW_PRIMARY_IP]:$MAILCOW_PRIMARY_PORT"
+    else
+        target="$MAILCOW_PRIMARY_IP:$MAILCOW_PRIMARY_PORT"
+    fi
+
+    if ! have openssl; then
+        warn "openssl is not available; the primary's SMTP certificate was not verified"
+        return 0
+    fi
+    out=$(timeout 20 openssl s_client -starttls smtp -connect "$target" \
+        -servername "$name" -verify_hostname "$name" -verify_return_error \
+        </dev/null 2>&1) || rc=$?
+    printf '%s\n' "$out" >>"$MXB_LOG_DIR/install.log"
+
+    if [[ "$rc" -eq 0 ]] && printf '%s' "$out" | grep -q 'Verify return code: 0'; then
+        log "primary SMTP TLS verified for $name ($target)"
+        return 0
+    fi
+    reason=$(printf '%s\n' "$out" | grep -m1 -E 'verify error|Verify return code|no peer certificate|handshake failure|wrong version' || true)
+    if [[ "$SMTP_TLS_MODE" == "secure" ]]; then
+        die "cannot verify TLS to the primary at $target for '$name' (${reason:-openssl exit $rc}); every queued message would be deferred. Fix the primary's certificate chain, or re-run with --smtp-tls-mode may to accept unverified TLS"
+    fi
+    warn "the primary at $target did not present a certificate verifiable as '$name' (${reason:-openssl exit $rc}); TLS to the primary is opportunistic and unauthenticated (SMTP_TLS_MODE=may)"
+}
+
+first_known_recipient() {
+    local key=""
+    [[ -r "$MXB_MAPS_DIR/relay_recipients" ]] || return 0
+    key=$(awk -F'\t' '$1 ~ /@/ && $1 !~ /^@/ { print $1; exit }' "$MXB_MAPS_DIR/relay_recipients" 2>/dev/null || true)
+    printf '%s' "$key"
+}
+
+# Read-only SMTP dialogue against the local listener. It proves that the SMTP
+# server can read relay_recipients and that recipient validation behaves, which
+# is what a chrooted smtpd or a stale map would break.
+smtp_selftest() {
+    local host=$1 port=$2 rc=0
+    timeout 20 bash -c '
+set -u
+host=$1 port=$2 ehlo_name=$3 known=$4 unknown=$5
+reply() {
+    local line code out=""
+    while IFS= read -r -t 8 line <&3; do
+        out="$out$line
+"
+        code=${line:0:3}
+        [[ ${line:3:1} == "-" ]] && continue
+        printf "%s" "$out"
+        return 0
+    done
+    return 1
+}
+exec 3<>"/dev/tcp/$host/$port" || { printf "connect=failed\n"; exit 7; }
+banner=$(reply) || { printf "connect=no-banner\n"; exit 8; }
+printf "banner_code=%s\n" "${banner:0:3}"
+printf "EHLO %s\r\n" "$ehlo_name" >&3
+ehlo=$(reply) || { printf "connect=no-ehlo\n"; exit 9; }
+printf "ehlo_code=%s\n" "${ehlo:0:3}"
+case "$ehlo" in *STARTTLS*) printf "starttls=yes\n" ;; *) printf "starttls=no\n" ;; esac
+printf "MAIL FROM:<>\r\n" >&3
+printf "mail_code=%s\n" "$(reply | cut -c1-3)"
+printf "RCPT TO:<%s>\r\n" "$known" >&3
+printf "known_code=%s\n" "$(reply | cut -c1-3)"
+printf "RCPT TO:<%s>\r\n" "$unknown" >&3
+printf "unknown_code=%s\n" "$(reply | cut -c1-3)"
+printf "QUIT\r\n" >&3
+exit 0
+' _ "$host" "$port" "$BACKUP_MX_HOSTNAME" "$3" "$4" 2>/dev/null || rc=$?
+    return "$rc"
+}
+
+probe_field() {
+    printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1
+}
+
+verify_smtp_path() {
+    local known unknown domain out="" rc=0 banner starttls known_code unknown_code
+    if [[ "${MXB_SKIP_SMTP_SELFTEST:-0}" == "1" ]]; then
+        log "skipping the SMTP self-test (MXB_SKIP_SMTP_SELFTEST=1)"
+        return 0
+    fi
+    known=$(first_known_recipient)
+    if [[ -z "$known" ]]; then
+        warn "no synchronized mailbox is available; the SMTP path was not self-tested"
+        return 0
+    fi
+    domain=${known##*@}
+    unknown="no-such-recipient-$$@$domain"
+
+    out=$(smtp_selftest 127.0.0.1 25 "$known" "$unknown") || rc=$?
+    if [[ "$rc" -ne 0 || -z "$out" ]]; then
+        warn "the SMTP self-test could not complete (exit $rc); verify manually: swaks --to $known --server 127.0.0.1 --quit-after RCPT"
+        return 0
+    fi
+    banner=$(probe_field "$out" banner_code)
+    starttls=$(probe_field "$out" starttls)
+    known_code=$(probe_field "$out" known_code)
+    unknown_code=$(probe_field "$out" unknown_code)
+
+    log "SMTP self-test: banner=${banner:-none} starttls=${starttls:-unknown} known_recipient=${known_code:-none} unknown_recipient=${unknown_code:-none}"
+
+    case "$known_code" in
+        2??) ;;
+        *)
+            die "the backup MX did not accept the synchronized recipient $known (SMTP $known_code); mail would be refused or queued. Check 'postmap -q $known hash:$MXB_MAPS_DIR/relay_recipients', 'postconf -h relay_recipient_maps' and 'journalctl -u postfix -n 50 --no-pager'"
+            ;;
+    esac
+    case "$unknown_code" in
+        5??) ;;
+        *)
+            warn "an unknown recipient at $domain was not rejected (SMTP $unknown_code); verify that the map is not in relaxed mode and that relay_recipients has no wildcard for this domain"
+            ;;
+    esac
+    if [[ -n "$SMTPD_TLS_CERT_FILE" && "$starttls" != "yes" ]]; then
+        die "inbound STARTTLS is configured but not advertised on 127.0.0.1:25; check 'postconf -h smtpd_tls_cert_file smtpd_tls_key_file' and 'journalctl -u postfix -n 50 --no-pager'"
+    fi
+}
+
 verify_api_access() {
     local code rc=0
     local -a args=(
@@ -896,10 +1343,16 @@ run_initial_sync() {
 
 print_summary() {
     local state="$MXB_STATE_DIR/state/sync-state.json" domains="?" mailboxes="?"
+    local inbound="disabled (no certificate)" outbound="$SMTP_TLS_MODE"
+    local operational=${OPERATIONAL_MAIL_TO:-discarded (no OPERATIONAL_MAIL_TO)}
     if [[ -r "$state" ]]; then
         domains=$(jq -r '.counts.domains // "?"' "$state" 2>/dev/null || printf '?')
         mailboxes=$(jq -r '.counts.mailboxes // "?"' "$state" 2>/dev/null || printf '?')
     fi
+    if [[ -n "$SMTPD_TLS_CERT_FILE" ]]; then
+        inbound="enabled ($(postconf -h smtpd_tls_cert_file 2>/dev/null || printf '%s' "$SMTPD_TLS_CERT_FILE"))"
+    fi
+    [[ "$SMTP_TLS_MODE" == "secure" ]] || outbound="may (unverified)"
     cat <<EOF
 
 Installation complete.
@@ -910,18 +1363,29 @@ Installation complete.
   Application        : $MXB_INSTALL_DIR (version $RESOLVED_VERSION)
   Configuration      : $MXB_CONFIG_FILE (0600)
   Domains / mailboxes: $domains / $mailboxes
+  Inbound STARTTLS   : $inbound
+  Outbound SMTP TLS  : $outbound (certificate name: ${SMTP_TLS_MATCH_HOSTNAME:-none})
+  Operational mail   : $operational
   Timer              : mailcow-sync.timer (every 2 hours, persistent)
 
 Next steps:
-  1. DNS: add "MX 20 ${BACKUP_MX_HOSTNAME:-<this-host>}." to every domain hosted by Mailcow,
-     and include the backup MX IP in the SPF record if it sends DSNs directly.
-  2. Mailcow: allowlist $MAILCOW_PRIMARY_IP's partner IP (this server) in
-     data/conf/postfix/custom_postscreen_whitelist.cidr and in rspamd if greylisting is strict.
-  3. Verify mail flow during a maintenance window.
+  1. DNS: publish "MX 20 ${BACKUP_MX_HOSTNAME:-<this-host>}." (a FQDN with a
+     trailing dot) for every Mailcow domain, and give ${BACKUP_MX_HOSTNAME:-<this-host>}
+     A/AAAA records plus a matching PTR record.
+  2. SPF: add "a:${BACKUP_MX_HOSTNAME:-<this-host>}" to the SPF record of domains this
+     server may send bounces for.
+  3. Mailcow: trust this server with the shipped script, run on the Mailcow host:
+       scp /opt/mx-backup-mailcow/share/mailcow/allowlist-backup-mx.sh root@${MAILCOW_HOST}:/root/
+       ssh root@${MAILCOW_HOST} 'bash /root/allowlist-backup-mx.sh --ip <this server public IP>'
+     It allowlists this IP in postscreen and skips rspamd greylisting for it,
+     and it is idempotent: re-run it after every Mailcow update.
+  4. Verify mail flow in a maintenance window:
+       swaks --to <known-mailbox> --server ${BACKUP_MX_HOSTNAME:-<this-host>} --quit-after RCPT
+       mx-diagnose
 
 Useful commands:
   sync-mailcow.sh --dry-run     # preview a synchronization
-  mx-diagnose                   # generate an AI-ready health report
+  mx-diagnose                   # health summary + AI-ready report
   mx-update-scripts --check     # check for application updates
   mx-update                     # update Ubuntu packages
 EOF
@@ -931,10 +1395,12 @@ main() {
     parse_args "$@"
     require_root
     check_os
-    check_hostname
+    DETECTED_FQDN=$(detect_fqdn)
     load_existing_config
     interactive_config
+    check_hostname
     validate_config
+    require_clock_sync
 
     if [[ "$NON_INTERACTIVE" -eq 0 && "$ASSUME_YES" -eq 0 ]]; then
         local answer=""
@@ -968,12 +1434,14 @@ main() {
     configure_postfix
     configure_firewall
     verify_api_access
+    verify_primary_smtp_tls
 
     if ! run_initial_sync; then
         print_summary
         exit 1
     fi
 
+    verify_smtp_path
     print_summary
     exit 0
 }

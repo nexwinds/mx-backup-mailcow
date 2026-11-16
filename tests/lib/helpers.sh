@@ -150,6 +150,11 @@ sandbox_init() {
     export MXB_POSTFIX_TEMPLATE_DIR="$TEST_TMP/postfix-templates"
     export MXB_SSH_DIR="$TEST_TMP/ssh"
     export MXB_CA_BUNDLE="$TEST_TMP/ca-certificates.crt"
+    export MXB_LETSENCRYPT_DIR="$TEST_TMP/letsencrypt"
+    export MXB_RENEWAL_HOOK_DIR="$TEST_TMP/letsencrypt/renewal-hooks/deploy"
+    export MAILCOW_DIR="$TEST_TMP/mailcow"
+    export MXB_ALLOWLIST_STATE="$TEST_TMP/mailcow-allowlist.conf"
+    export MXB_ALLOWLIST_BACKUP_DIR="$TEST_TMP/allowlist-backups"
 
     export MOCK_DIR="$TEST_TMP/mock"
     export MOCK_FIXTURES="$TEST_TMP/fixtures"
@@ -161,6 +166,8 @@ sandbox_init() {
         "$MXB_BACKUP_DIR" "$MOCK_DIR" "$MOCK_FIXTURES" "$MXB_BIN_DIR" "$TEST_TMP/bin" \
         "$MXB_SYSTEMD_DIR" "$MXB_LOGROTATE_DIR" "$MXB_POSTFIX_ETC" \
         "$MXB_POSTFIX_TEMPLATE_DIR" "$MXB_SSH_DIR"
+    mkdir -p "$MAILCOW_DIR/data/conf/postfix" "$MAILCOW_DIR/data/conf/rspamd/local.d"
+    : >"$MAILCOW_DIR/docker-compose.yml"
     printf 'Port 22\n' >"$MXB_SSH_DIR/sshd_config"
     cat >"$MXB_POSTFIX_TEMPLATE_DIR/main.cf.debian" <<'EOF'
 # Postfix package template (test fixture)
@@ -190,13 +197,17 @@ reset_runtime() {
 
 write_config() {
     cat >"$MXB_CONFIG_FILE" <<'EOF'
+BACKUP_MX_HOSTNAME="mx2.example.com"
 MAILCOW_HOST="mail.example.com"
 MAILCOW_API_KEY="0123456789abcdef0123456789abcdef"
 MAILCOW_API_CA_FILE=""
 MAILCOW_PRIMARY_IP="203.0.113.10"
 MAILCOW_PRIMARY_PORT=25
-SMTP_TLS_MODE="may"
-SMTP_TLS_MATCH_HOSTNAME=""
+SMTP_TLS_MODE="secure"
+SMTP_TLS_MATCH_HOSTNAME="mail.example.com"
+SMTPD_TLS_CERT_FILE=""
+SMTPD_TLS_KEY_FILE=""
+OPERATIONAL_MAIL_TO=""
 EXCLUDE_DOMAINS=""
 RELAX_AFTER_DAYS=7
 QUEUE_LIFETIME="7d"

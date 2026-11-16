@@ -31,6 +31,10 @@ for entry in \
     "mx-backup-mailcow-2.3.4/systemd/mailcow-sync.service" \
     "mx-backup-mailcow-2.3.4/systemd/mailcow-sync.timer" \
     "mx-backup-mailcow-2.3.4/share/doc/README.md" \
+    "mx-backup-mailcow-2.3.4/share/doc/OPERATIONS.md" \
+    "mx-backup-mailcow-2.3.4/share/doc/TROUBLESHOOTING.md" \
+    "mx-backup-mailcow-2.3.4/share/doc/DOCS.md" \
+    "mx-backup-mailcow-2.3.4/share/mailcow/allowlist-backup-mx.sh" \
     "mx-backup-mailcow-2.3.4/config/config.example" \
     "mx-backup-mailcow-2.3.4/logrotate/mailcow-backup-mx"; do
     assert_contains "$listing" "$entry" "archive contains $entry"

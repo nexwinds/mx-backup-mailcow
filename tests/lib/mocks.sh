@@ -39,12 +39,28 @@ mock_reset_postconf() {
     cat >"$MOCK_DIR/postconf.state" <<EOF
 compatibility_level = 3.6
 mail_version = 3.8.6
+queue_directory = ${TEST_TMP:-/tmp}/queue
 relay_domains = hash:$MXB_MAPS_DIR/relay_domains
 relay_recipient_maps = hash:$MXB_MAPS_DIR/relay_recipients
 transport_maps = hash:$MXB_MAPS_DIR/transport
 smtp_tls_policy_maps = hash:$MXB_MAPS_DIR/smtp_tls_policy
 mynetworks = 127.0.0.0/8 [::1]/128
 smtpd_relay_restrictions = permit_mynetworks, reject_unauth_destination
+EOF
+    # master.cf model: one entry per line, plus per-entry chroot fields.
+    cat >"$MOCK_DIR/master.state" <<'EOF'
+smtp/inet
+smtp/unix
+pickup/unix
+uucp/unix
+lmtp/unix
+virtual/unix
+relay/unix
+EOF
+    cat >"$MOCK_DIR/chroot.state" <<'EOF'
+smtp/inet/chroot=y
+smtp/unix/chroot=y
+pickup/unix/chroot=n
 EOF
 }
 
@@ -71,6 +87,11 @@ mock_reset() {
     export MOCK_GH_RATE_LIMIT=0
     export MOCK_POSTCONF_UNCONFIGURED=0
     export MOCK_POSTCONF_COMPAT=3.6
+    export MOCK_NTPSYNC=yes
+    export MOCK_POSTSCREEN_ACCESS=""
+    export MOCK_RSPAMD_CONFIGTEST_FAIL=0
+    export MOCK_RSPAMD_RESTART_FAIL=0
+    export MOCK_RSPAMD_DOWN=0
 }
 
 mock_calls_contain() { grep -qF -- "$1" "$MOCK_DIR/calls.log"; }
@@ -85,7 +106,7 @@ mock_clear_calls() { : >"$MOCK_DIR/calls.log"; }
 # curl
 # ---------------------------------------------------------------------------
 curl() {
-    local out="" writeout="" url="" config=0 failmode=0 code=200 body="" src=""
+    local out="" writeout="" url="" config=0 failmode=0 code=200 body="" src="" wo=""
     local -a positional=()
     while (( $# > 0 )); do
         case "$1" in
@@ -122,7 +143,15 @@ curl() {
 
     if [[ "${MOCK_CURL_FAIL:-0}" == "1" ]]; then
         [[ -n "$out" ]] && : >"$out"
-        [[ -n "$writeout" ]] && printf '000'
+        if [[ -n "$writeout" ]]; then
+            wo=$writeout
+            wo=${wo//%\{http_code\}/000}
+            wo=${wo//%\{time_total\}/0.000000}
+            wo=${wo//%\{ssl_verify_result\}/0}
+            printf '%s' "$wo"
+        else
+            printf '000'
+        fi
         return 7
     fi
 
@@ -197,7 +226,13 @@ curl() {
     fi
 
     if [[ -n "$writeout" ]]; then
-        printf '%s' "$code"
+        # Emulate the curl placeholders the scripts rely on, so their parsing is
+        # exercised instead of being short-circuited by a fixed string.
+        wo=$writeout
+        wo=${wo//%\{http_code\}/$code}
+        wo=${wo//%\{time_total\}/0.100000}
+        wo=${wo//%\{ssl_verify_result\}/0}
+        printf '%s' "$wo"
     fi
     if [[ "$failmode" -eq 1 && "$code" != "200" ]]; then
         return 22
@@ -228,7 +263,7 @@ postmap() {
         local lookup_file
         lookup_file="$path"
         [[ -f "$path.db" ]] && lookup_file="$path.db"
-        awk -v k="$key" 'tolower($1) == tolower(k) { print $2; found = 1; exit } END { if (!found) exit 1 }' "$lookup_file"
+        awk -v k="$key" 'tolower($1) == tolower(k) { sub(/^[^ \t]+[ \t]+/, ""); print; found = 1; exit } END { if (!found) exit 1 }' "$lookup_file"
         return
     fi
     if [[ "$dump" -eq 1 ]]; then
@@ -238,9 +273,13 @@ postmap() {
     cp "$path" "$path.db"
 }
 
+postalias() { mock_log "postalias $*"; postmap "$@"; }
+
 postconf() {
     mock_log "postconf $*"
     local state="$MOCK_DIR/postconf.state"
+    local master="$MOCK_DIR/master.state"
+    local chroots="$MOCK_DIR/chroot.state"
     local compat="${MOCK_POSTCONF_COMPAT:-3.6}"
     local default=0 short=0 mode="" param="" kv="" value=""
     local -a positional=()
@@ -250,6 +289,9 @@ postconf() {
             -e) mode=e; kv=${2:-}; shift 2 ;;
             -n) mode=n; shift ;;
             -M) mode=M; shift ;;
+            -MX) mode=MX; shift ;;
+            -F) mode=F; shift ;;
+            -X) mode=X; shift ;;
             -d) default=1; shift ;;
             -h) short=1; shift ;;
             -c) shift 2 ;;
@@ -281,11 +323,54 @@ postconf() {
             mv "$state.tmp" "$state"
             return 0
             ;;
+        X)
+            local p
+            for p in "${positional[@]}"; do
+                [[ -n "$p" ]] || continue
+                awk -v k="$p" -F' = ' '$1 != k' "$state" >"$state.tmp"
+                mv "$state.tmp" "$state"
+            done
+            return 0
+            ;;
         n) cat "$state"; return 0 ;;
         M)
-            printf 'smtp      inet  n       -       y       -       -       smtpd\n'
-            printf 'pickup    unix  n       -       y       60      1       pickup\n'
+            local entry
+            while IFS= read -r entry; do
+                [[ -n "$entry" ]] || continue
+                if [[ -n "$param" && "$entry" != "$param" ]]; then
+                    continue
+                fi
+                printf '%s  %s  n  -  y  -  -  %s\n' "${entry%%/*}" "${entry##*/}" "${entry##*/}"
+            done <"$master"
             return 0
+            ;;
+        MX)
+            local name
+            for name in "${positional[@]}"; do
+                [[ -n "$name" ]] || continue
+                grep -vxF -- "$name" "$master" >"$master.tmp" 2>/dev/null || :
+                mv "$master.tmp" "$master"
+                grep -vxF -- "$name" "$chroots" >"$chroots.tmp" 2>/dev/null || :
+                mv "$chroots.tmp" "$chroots"
+            done
+            return 0
+            ;;
+        F)
+            local arg=${positional[0]:-} fkey fval
+            [[ -n "$arg" ]] || return 1
+            if [[ "$arg" == *"="* ]]; then
+                fkey=${arg%%=*}
+                fval=${arg#*=}
+                awk -v k="$fkey" -v v="$fval" '
+                    BEGIN { done = 0 }
+                    { split($0, a, "="); if (a[1] == k) { print k "=" v; done = 1 } else print }
+                    END { if (!done) print k "=" v }
+                ' "$chroots" >"$chroots.tmp"
+                mv "$chroots.tmp" "$chroots"
+                return 0
+            fi
+            awk -v k="$arg" -F= '$1 == k { print; found = 1 } END { exit found ? 0 : 1 }' "$chroots"
+            return
             ;;
     esac
 
@@ -364,8 +449,15 @@ systemctl() {
             return 0
             ;;
         is-active)
+            local state quiet=0 arg
+            for arg in "$@"; do
+                [[ "$arg" == "--quiet" || "$arg" == "-q" ]] && quiet=1
+            done
             unit=${!#}
-            [[ "$(mock_get_unit_state "$unit")" == "active" ]]
+            state=$(mock_get_unit_state "$unit")
+            [[ -n "$state" ]] || state="inactive"
+            (( quiet == 1 )) || printf '%s\n' "$state"
+            [[ "$state" == "active" ]]
             return
             ;;
         is-enabled)
@@ -404,22 +496,45 @@ free() { mock_log "free $*"; printf '               total        used        fre
 
 df() { mock_log "df $*"; printf 'Filesystem      Size  Used Avail Use%% Mounted on\n/dev/sda1        40G  8.0G   30G  22%% /\n'; }
 
-timedatectl() { mock_log "timedatectl $*"; printf 'System clock synchronized: yes\nNTP service: active\n'; }
+timedatectl() {
+    mock_log "timedatectl $*"
+    case "$*" in
+        *show*)
+            case "$*" in
+                *NTPSynchronized*) printf '%s\n' "${MOCK_NTPSYNC:-yes}" ;;
+                *) printf 'NTPMessage={ "ServerName": "ntp.example.com", "OffsetUSec": 120 }\n' ;;
+            esac
+            return 0
+            ;;
+    esac
+    printf 'System clock synchronized: %s\nNTP service: active\n' "${MOCK_NTPSYNC:-yes}"
+}
 
 openssl() {
     mock_log "openssl $*"
     case "$*" in
         *s_client*)
             printf 'CONNECTED(00000003)\n'
+            if [[ "${MOCK_TLS_FAIL:-0}" == "1" ]]; then
+                printf 'verify error:num=20:unable to get local issuer certificate\n'
+                printf 'Verify return code: 20 (unable to get local issuer certificate)\n'
+                return 1
+            fi
             printf -- '-----BEGIN CERTIFICATE-----\nMIIBmockCertificate\n-----END CERTIFICATE-----\n'
+            printf 'Verify return code: 0 (ok)\n'
             ;;
         *)
+            if [[ "$*" == *"-checkhost"* && "${MOCK_CERT_HOST_MISMATCH:-0}" == "1" ]]; then
+                printf 'Hostname does NOT match certificate\n' >&2
+                return 1
+            fi
             printf 'subject=CN = mail.example.com\n'
             printf 'issuer=C = US, O = Test CA, CN = Test CA\n'
             printf 'notBefore=Jan  1 00:00:00 2026 GMT\n'
             printf 'notAfter=Apr  1 00:00:00 2026 GMT\n'
             ;;
     esac
+    return 0
 }
 
 getent() { mock_log "getent $*"; printf '203.0.113.10    mail.example.com\n'; }
@@ -481,7 +596,132 @@ timeout() {
     "$@"
 }
 
+mock_cidr_lookup() {
+    local address=$1 map=$2 path
+    path=${map#cidr:}
+    case "$path" in
+        /opt/postfix/conf/*) path="$MAILCOW_DIR/data/conf/postfix/${path#/opt/postfix/conf/}" ;;
+    esac
+    [[ -r "$path" ]] || return 1
+    awk -v ip="$address" '
+        ($1 == ip || $1 == ip "/32" || $1 == ip "/128") && $2 == "permit" { found = 1 }
+        END { exit found ? 0 : 1 }
+    ' "$path" || return 1
+    printf 'permit'
+}
+
+mock_compose_exec() {
+    local service=$1
+    shift || true
+    local command=${1:-}
+    case "$service:$command" in
+        postfix-mailcow:postconf)
+            shift || true
+            [[ "${1:-}" == "-h" ]] || return 0
+            printf '%s\n' "${MOCK_POSTSCREEN_ACCESS:-permit_mynetworks, cidr:/opt/postfix/conf/custom_postscreen_whitelist.cidr, cidr:/opt/postfix/conf/postscreen_access.cidr, tcp:127.0.0.1:10027}"
+            ;;
+        postfix-mailcow:postmap)
+            shift || true
+            local address="" map=""
+            while (( $# )); do
+                case "$1" in
+                    -q) address=${2:-}; shift 2 ;;
+                    *) map=${1:-}; shift ;;
+                esac
+            done
+            mock_cidr_lookup "$address" "$map"
+            ;;
+        postfix-mailcow:postfix)
+            if [[ "$*" == *reload* && "${MOCK_RELOAD_FAIL:-0}" == "1" ]]; then
+                return 1
+            fi
+            return 0
+            ;;
+        rspamd-mailcow:rspamadm)
+            shift || true
+            case "${1:-}" in
+                configtest)
+                    if [[ "${MOCK_RSPAMD_CONFIGTEST_FAIL:-0}" == "1" ]]; then
+                        printf 'cannot parse the configuration\n' >&2
+                        return 1
+                    fi
+                    return 0
+                    ;;
+                configdump)
+                    if [[ -r "$MAILCOW_DIR/data/conf/rspamd/local.d/settings.conf" ]]; then
+                        cat "$MAILCOW_DIR/data/conf/rspamd/local.d/settings.conf"
+                    fi
+                    return 0
+                    ;;
+                control)
+                    [[ "${MOCK_RSPAMD_DOWN:-0}" == "1" ]] && return 1
+                    return 0
+                    ;;
+            esac
+            return 0
+            ;;
+    esac
+    return 0
+}
+
+docker() {
+    mock_log "docker $*"
+    local command=${1:-}
+    shift || true
+    case "$command" in
+        compose)
+            local sub=${1:-}
+            shift || true
+            case "$sub" in
+                version) return 0 ;;
+                ps)
+                    local service=""
+                    while (( $# )); do
+                        case "$1" in
+                            -q|--quiet) shift ;;
+                            *) service=${1:-}; shift ;;
+                        esac
+                    done
+                    [[ -n "$service" ]] && printf 'cid-%s\n' "$service"
+                    return 0
+                    ;;
+                exec)
+                    [[ "${1:-}" == "-T" ]] && shift
+                    local service=${1:-}
+                    shift || true
+                    mock_compose_exec "$service" "$@"
+                    return $?
+                    ;;
+                restart)
+                    local service=${1:-}
+                    if [[ "${MOCK_RSPAMD_RESTART_FAIL:-0}" == "1" && "$service" == "rspamd-mailcow" ]]; then
+                        return 1
+                    fi
+                    return 0
+                    ;;
+            esac
+            return 0
+            ;;
+        inspect)
+            [[ "${1:-}" == "-f" ]] && shift 2
+            local cid=${1:-}
+            case "$cid" in
+                cid-rspamd-mailcow)
+                    printf '/etc/rspamd/local.d=%s\n' "$MAILCOW_DIR/data/conf/rspamd/local.d"
+                    ;;
+                *)
+                    printf '/opt/postfix/conf=%s\n' "$MAILCOW_DIR/data/conf/postfix"
+                    printf '/etc/ssl/mail=%s\n' "$MAILCOW_DIR/data/assets/ssl"
+                    ;;
+            esac
+            return 0
+            ;;
+    esac
+    return 0
+}
+
 export -f mock_log mock_set_unit_state mock_get_unit_state mock_reset_postconf
-export -f curl postmap postconf postfix postqueue newaliases
+export -f mock_cidr_lookup mock_compose_exec
+export -f curl postmap postalias postconf postfix postqueue newaliases
 export -f systemctl journalctl ss free df timedatectl openssl getent needrestart ufw hostname
-export -f dpkg dpkg-query apt-get timeout
+export -f dpkg dpkg-query apt-get timeout docker

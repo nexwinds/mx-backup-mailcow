@@ -47,6 +47,33 @@ assert_contains "$LAST_OUTPUT" "## 6. Application version and updates" "update s
 assert_contains "$LAST_OUTPUT" "mailcow_host: mail.example.com" "configuration summary is in the report stream"
 assert_contains "$LAST_OUTPUT" "installed_version:" "installed version is reported"
 assert_contains "$LAST_OUTPUT" "notAfter=" "certificate validity is reported"
+assert_contains "$LAST_OUTPUT" "Clock synchronization state" "clock state is reported"
+assert_contains "$LAST_OUTPUT" "Inbound TLS (port 25)" "inbound TLS state is reported"
+assert_contains "$LAST_OUTPUT" "starttls: not configured" "missing inbound TLS is stated explicitly"
+assert_contains "$LAST_OUTPUT" "Postfix chroot and map visibility" "chroot visibility is reported"
+assert_contains "$LAST_OUTPUT" "smtpd cannot read" "the chroot consequence is explained"
+assert_contains "$LAST_OUTPUT" "Local recipient acceptance (RCPT probe)" "the RCPT probe is reported"
+assert_contains "$LAST_OUTPUT" "probe unavailable" "an unusable probe is stated, not hidden"
+assert_contains "$LAST_OUTPUT" "Forward-hop TLS verification" "forward-hop TLS is reported"
+assert_contains "$LAST_OUTPUT" "policy mode: secure" "the forwarding policy mode is reported"
+assert_contains "$LAST_OUTPUT" "Delivery evidence" "delivery evidence is reported"
+assert_contains "$LAST_OUTPUT" "Map consistency" "map consistency is reported"
+assert_contains "$LAST_OUTPUT" "domains without a transport entry (would loop to this host): none" \
+    "transport coverage is verified"
+assert_contains "$LAST_OUTPUT" "smtp_tls_policy: [203.0.113.10]:25 secure match=mail.example.com" \
+    "the effective TLS policy is reported verbatim"
+assert_contains "$LAST_OUTPUT" "tls_verify: ok" \
+    "the API TLS result is interpreted instead of printed as a bare number"
+
+begin "a failed API connection is not reported as verified TLS"
+export MOCK_CURL_FAIL=1
+run bash "$DIAGNOSE" --stdout --lines 20
+assert_status 0 "diagnose should succeed even when curl fails"
+assert_contains "$LAST_OUTPUT" "tls_verify: unknown (curl exited" \
+    "a connection failure must not be called verified TLS"
+assert_not_contains "$LAST_OUTPUT" "tls_verify: ok" \
+    "no TLS response means the chain was not verified"
+export MOCK_CURL_FAIL=0
 
 begin "credentials and private keys are redacted"
 assert_not_contains "$LAST_OUTPUT" "$API_KEY" "API key must not appear"
@@ -86,6 +113,38 @@ for pattern in "postconf -e" "systemctl restart" "systemctl start" "systemctl st
 done
 assert_contains "$(cat "$MOCK_DIR/calls.log")" "postqueue -j" "queue read through postqueue -j"
 
+begin "the terminal summary answers whether the server works"
+mock_set_unit_state postfix active
+mock_set_unit_state mailcow-sync.timer active
+postconf -e 'smtpd_tls_cert_file=/etc/ssl/mail/cert.pem'
+postconf -e 'smtpd_tls_key_file=/etc/ssl/mail/key.pem'
+run bash "$DIAGNOSE" --lines 20
+assert_status 0 "summary run should succeed"
+assert_contains "$LAST_OUTPUT" "Health summary (version" "the summary must be printed"
+assert_contains "$LAST_OUTPUT" "Host:" "host is summarised"
+assert_contains "$LAST_OUTPUT" "Postfix:" "Postfix state is summarised"
+assert_contains "$LAST_OUTPUT" "Sync timer:" "timer state is summarised"
+assert_contains "$LAST_OUTPUT" "Last sync:" "last synchronization is summarised"
+assert_contains "$LAST_OUTPUT" "ok via api" "the successful API source is summarised"
+assert_contains "$LAST_OUTPUT" "Inbound STARTTLS:" "inbound TLS is summarised"
+assert_contains "$LAST_OUTPUT" "Outbound SMTP TLS:" "outbound TLS is summarised"
+assert_contains "$LAST_OUTPUT" "secure (verified as" "outbound TLS verification is summarised"
+assert_contains "$LAST_OUTPUT" "healthy - no obvious problems detected" "a healthy server must get a plain verdict"
+assert_not_contains "$LAST_OUTPUT" "Attention:" "a healthy server has no attention list"
+summary_report=$(printf '%s\n' "$LAST_OUTPUT" | tail -n 1)
+assert_file "$summary_report" "the report path stays the last line"
+
+begin "the summary flags a degraded sync and a stale API"
+set_state_epoch "$(( $(date +%s) - 18000 ))"
+jq '.status = "degraded" | .source = "cache"' "$MXB_STATE_DIR/state/sync-state.json" \
+    >"$MXB_STATE_DIR/state/sync-state.json.tmp"
+mv "$MXB_STATE_DIR/state/sync-state.json.tmp" "$MXB_STATE_DIR/state/sync-state.json"
+run bash "$DIAGNOSE" --lines 20
+assert_status 0 "degraded summary run should succeed"
+assert_contains "$LAST_OUTPUT" "Assessment:           needs attention" "a degraded sync must be flagged"
+assert_contains "$LAST_OUTPUT" "the maps come from cache" "the cache fallback must be explained"
+assert_contains "$LAST_OUTPUT" "over 4 hours old" "a stale API success must be flagged"
+
 begin "report file is created with restrictive permissions"
 run bash "$DIAGNOSE" --lines 20
 assert_status 0 "file mode should succeed"
@@ -96,7 +155,15 @@ assert_contains "$(cat "$report")" "## AI analysis prompt" "file report contains
 assert_contains "$(cat "$report")" "mailcow_host: mail.example.com" "configuration summary is written to the report"
 assert_contains "$(cat "$report")" "$MXB_CONFIG_FILE" "file permissions are written to the report"
 assert_contains "$(cat "$report")" "installed_version:" "installed version is written to the report"
-assert_eq "$(printf '%s\n' "$LAST_OUTPUT" | wc -l | tr -d ' ')" "1" "stdout must contain only the report path"
+assert_contains "$LAST_OUTPUT" "Health summary" "the terminal receives the summary"
+assert_eq "$(printf '%s\n' "$LAST_OUTPUT" | tail -n 1)" "$report" "the report path must be the last line"
+
+begin "--stdout keeps the report stream clean"
+bash "$DIAGNOSE" --stdout --lines 10 >"$TEST_TMP/stdout.out" 2>"$TEST_TMP/stderr.out"
+assert_status 0 "the stdout mode should succeed"
+assert_contains "$(cat "$TEST_TMP/stdout.out")" "## AI analysis prompt" "the report stays on stdout"
+assert_not_contains "$(cat "$TEST_TMP/stdout.out")" "Health summary" "the summary must not pollute the report"
+assert_contains "$(cat "$TEST_TMP/stderr.out")" "Health summary" "the summary is still shown on stderr"
 
 begin "unit name masking is limited to address-like names"
 assert_contains "$(cat "$report")" "postfix@-.service" "the postfix@- unit name must not be masked"

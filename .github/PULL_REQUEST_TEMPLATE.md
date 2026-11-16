@@ -23,7 +23,8 @@ performed and on which host (never paste real mail content). -->
 - [ ] `make lint` and `make test` pass locally
 - [ ] Markdown/YAML changes pass `bun run format:check`
 - [ ] Behaviour changes include a test; documentation-only changes say so here
-- [ ] Operator-visible documentation updated (`README.md`, `DOCS.md`)
+- [ ] Operator-visible documentation updated (`README.md`, `OPERATIONS.md`,
+      `TROUBLESHOOTING.md`, `DOCS.md`)
 - [ ] One topic only, no unrelated reformatting or drive-by edits
 - [ ] No secrets, API keys, private keys, real addresses or message content
 

@@ -6,6 +6,10 @@
 #
 # Managed keys are rewritten by install.sh; extra lines are preserved.
 
+# Postfix identity used for HELO, $myorigin and DSN senders. Must be a fully
+# qualified domain name whose A/AAAA and PTR records point at this server.
+BACKUP_MX_HOSTNAME="mx2.example.com"
+
 # Mailcow hostname used for the API (no scheme, no path).
 MAILCOW_HOST="mail.example.com"
 
@@ -19,10 +23,24 @@ MAILCOW_API_CA_FILE=""
 MAILCOW_PRIMARY_IP="203.0.113.10"
 MAILCOW_PRIMARY_PORT=25
 
-# Outbound SMTP TLS policy to the primary: may (opportunistic) or secure.
-# secure requires SMTP_TLS_MATCH_HOSTNAME and a certificate valid for it.
-SMTP_TLS_MODE="may"
-SMTP_TLS_MATCH_HOSTNAME=""
+# Outbound SMTP TLS policy to the primary: secure (default) or may.
+# secure requires SMTP_TLS_MATCH_HOSTNAME and a certificate valid for it; it is
+# the only mode in which the hop carrying queued mail is authenticated.
+SMTP_TLS_MODE="secure"
+SMTP_TLS_MATCH_HOSTNAME="mail.example.com"
+
+# Inbound TLS material offered to sending MTAs. Point these at the renewal
+# store (certbot's /etc/letsencrypt/live/<hostname>/): install.sh copies the
+# chain and key into /etc/postfix/tls where the postfix user can read them, and
+# installs a certbot deploy hook so renewals update the copies.
+# Leave empty to run without STARTTLS (senders enforcing MTA-STS or DANE then
+# cannot deliver to this MX).
+SMTPD_TLS_CERT_FILE=""
+SMTPD_TLS_KEY_FILE=""
+
+# Forward operational mail (root, postmaster, abuse, ...) to this address.
+# Empty discards it, which is the default because this server stores no mail.
+OPERATIONAL_MAIL_TO=""
 
 # Space-separated domains to exclude from synchronization.
 EXCLUDE_DOMAINS=""

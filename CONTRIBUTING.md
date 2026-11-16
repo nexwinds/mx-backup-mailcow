@@ -89,7 +89,7 @@ bash tests/test-install.sh
 ```
 
 The suite is offline and never touches the real system: every external command
-(`curl`, `postmap`, `systemctl`, `apt-get`, …) is replaced by an exported Bash
+(`curl`, `postmap`, `postalias`, `docker`, `systemctl`, `apt-get`, …) is replaced by an exported Bash
 function mock, and every path is redirected through `MXB_*` variables.
 
 | Test file                      | Focus                                                                                                          |
@@ -98,6 +98,8 @@ function mock, and every path is redirected through `MXB_*` variables.
 | `tests/test-sync-failure.sh`   | API errors, invalid JSON, suspicious drops, postmap/reload failures, rollback, relaxation, invalid entries     |
 | `tests/test-recipients.sh`     | recipient simulation: exact, plus-addressing, catch-all, alias domains, relay-all, unrelated domains           |
 | `tests/test-install.sh`        | bootstrap, idempotency, preserved secrets, first-sync failure, checksum mismatch, local install, OS validation |
+| `tests/test-postfix-config.sh` | FQDN identity, clock gate, secure TLS policy, inbound TLS staging, aliases, chroot visibility, self-test       |
+| `tests/test-allowlist.sh`      | Mailcow postscreen/rspamd allowlist: apply, drift, dry run, remove, rollback                                   |
 | `tests/test-update.sh`         | success, failure reporting, dry run, reboot detection, quiet mode, no destructive calls                        |
 | `tests/test-diagnose.sh`       | AI prompt, redaction, address masking, read-only guarantees, report permissions                                |
 | `tests/test-update-scripts.sh` | check, dry run, checksum/syntax rejection, self-update verification, rollback, safety                          |
@@ -154,8 +156,11 @@ instead of the formatter.
 
 ### Documentation
 
-- `README.md` — what an operator reads: install, API key, health checks,
-  troubleshooting.
+- `README.md` — the landing page: requirements, Quick start, Quick update, API
+  key, Mailcow allowlist, health summary.
+- `OPERATIONS.md` — procedures: installation details, health report, architecture,
+  DNS/firewall, configuration, releases, maintenance, security, limitations.
+- `TROUBLESHOOTING.md` — symptom-first fixes, summary verdicts, diagnostics.
 - `DOCS.md` — lookup material: configuration keys, script flags, map and state
   tables, runtime paths, verification checks. If you add a key, a flag or a
   table, it belongs here.
@@ -269,7 +274,7 @@ Never include a real Mailcow API key, a private key, or actual message content.
 `mx-diagnose` already redacts them; use its output where possible.
 
 The security properties the project will not trade away are listed in
-[`README.md`](README.md#security-notes).
+[`OPERATIONS.md`](OPERATIONS.md#security-notes).
 
 ## License
 

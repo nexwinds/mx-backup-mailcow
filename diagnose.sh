@@ -59,6 +59,10 @@ Options:
 
 The report contains an AI analysis prompt followed by sanitized system,
 Postfix, synchronization, connectivity and update information.
+
+After writing the report, a short health summary is printed to the terminal and
+the report path is printed as the last line. With --stdout, the summary goes to
+standard error so the report stream stays clean.
 EOF
 }
 
@@ -209,6 +213,8 @@ section_system() {
     run_block "Disk usage" df -h /
     run_block "Inode usage" df -i /
     run_block "Time synchronization" timedatectl
+    run_shell_block "Clock synchronization state" \
+        "timedatectl show -p NTPSynchronized -p NTPMessage 2>&1 || true"
     run_block "Failed systemd units" systemctl --failed --no-legend --no-pager
 }
 
@@ -254,6 +260,184 @@ queue_summary() {
         }' "$json" 2>/dev/null || printf 'could not parse postqueue -j output\n'
 }
 
+resolve_addresses() {
+    getent ahosts "$1" 2>/dev/null | awk '{print $1}' | awk '!seen[$0]++'
+}
+
+# A local RCPT-only dialogue: it proves that the running smtpd can read
+# relay_recipients and that recipient validation is enforced. No message is
+# queued and no mailbox is touched.
+local_recipient_probe() {
+    local known unknown out rc=0 ehlo_name
+    known=$(awk -F'\t' '$1 ~ /@/ && $1 !~ /^@/ { print $1; exit }' \
+        "$MXB_MAPS_DIR/relay_recipients" 2>/dev/null || true)
+    if [[ -z "$known" ]]; then
+        printf 'skipped: no synchronized mailbox in %s/relay_recipients\n' "$MXB_MAPS_DIR"
+        return 0
+    fi
+    ehlo_name=$(postconf -h myhostname 2>/dev/null || true)
+    [[ -n "$ehlo_name" ]] || ehlo_name=localhost
+    unknown="no-such-recipient-diagnose@${known##*@}"
+
+    out=$(timeout 15 bash -c '
+set -u
+host=$1 port=$2 ehlo_name=$3 known=$4 unknown=$5
+reply() {
+    local line code out=""
+    while IFS= read -r -t 8 line <&3; do
+        out="$out$line
+"
+        code=${line:0:3}
+        [[ ${line:3:1} == "-" ]] && continue
+        printf "%s" "$out"
+        return 0
+    done
+    return 1
+}
+exec 3<>"/dev/tcp/$host/$port" || { printf "connect=failed\n"; exit 7; }
+banner=$(reply) || { printf "connect=no-banner\n"; exit 8; }
+printf "banner_code=%s\n" "${banner:0:3}"
+printf "EHLO %s\r\n" "$ehlo_name" >&3
+ehlo=$(reply) || { printf "connect=no-ehlo\n"; exit 9; }
+printf "ehlo_code=%s\n" "${ehlo:0:3}"
+case "$ehlo" in *STARTTLS*) printf "starttls=yes\n" ;; *) printf "starttls=no\n" ;; esac
+printf "MAIL FROM:<>\r\n" >&3
+printf "mail_code=%s\n" "$(reply | cut -c1-3)"
+printf "RCPT TO:<%s>\r\n" "$known" >&3
+printf "known_code=%s\n" "$(reply | cut -c1-3)"
+printf "RCPT TO:<%s>\r\n" "$unknown" >&3
+printf "unknown_code=%s\n" "$(reply | cut -c1-3)"
+printf "QUIT\r\n" >&3
+exit 0
+' _ 127.0.0.1 25 "$ehlo_name" "$known" "$unknown" 2>/dev/null) || rc=$?
+
+    if [[ "$rc" -ne 0 || -z "$out" ]]; then
+        printf 'probe unavailable (exit %s): the local listener did not complete the dialogue\n' "$rc"
+        return 0
+    fi
+    printf 'tested recipient: %s\n' "$known"
+    printf '%s\n' "$out" | grep -v '^$'
+    local known_code
+    known_code=$(printf '%s\n' "$out" | sed -n 's/^known_code=//p' | head -n 1)
+    case "$known_code" in
+        2??) printf 'verdict: a synchronized recipient is accepted\n' ;;
+        *) printf 'verdict: a synchronized recipient was NOT accepted (SMTP %s); smtpd may not be able to read the map\n' "${known_code:-unknown}" ;;
+    esac
+}
+
+inbound_tls_block() {
+    local host cert key out rc=0
+    host=$(postconf -h myhostname 2>/dev/null || true)
+    [[ -n "$host" ]] || host=localhost
+    cert=$(postconf -h smtpd_tls_cert_file 2>/dev/null || true)
+    key=$(postconf -h smtpd_tls_key_file 2>/dev/null || true)
+    printf 'myhostname: %s\nsmtpd_tls_cert_file: %s\nsmtpd_tls_key_file: %s\n' \
+        "$host" "${cert:-<not set>}" "${key:-<not set>}"
+    if [[ -z "$cert" ]]; then
+        printf 'starttls: not configured; senders that enforce MTA-STS or DANE cannot deliver here\n'
+        return 0
+    fi
+    out=$(timeout 12 openssl s_client -starttls smtp -connect 127.0.0.1:25 \
+        -servername "$host" </dev/null 2>&1) || rc=$?
+    if printf '%s' "$out" | grep -q 'BEGIN CERTIFICATE'; then
+        printf 'starttls: advertised and usable (openssl exit %s)\n' "$rc"
+        printf '%s\n' "$out" | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' \
+            | openssl x509 -noout -subject -dates -checkhost "$host" 2>&1 || true
+    else
+        printf 'starttls: handshake failed (openssl exit %s)\n' "$rc"
+        printf '%s\n' "$out" | grep -aiE 'error|fail|timeout|refused|wrong version' | head -n 3 || true
+    fi
+}
+
+# A chrooted Postfix process resolves paths inside the queue directory, so a
+# map stored in /etc/postfix is invisible to it.
+chroot_visibility_block() {
+    local queue_dir jail chroot_value
+    queue_dir=$(postconf -h queue_directory 2>/dev/null || true)
+    [[ -n "$queue_dir" ]] || queue_dir=$(postconf -d -h queue_directory 2>/dev/null || true)
+    chroot_value=$(postconf -F smtp/inet/chroot 2>/dev/null || true)
+    printf 'smtp/inet chroot: %s\n' "${chroot_value:-unknown}"
+    if [[ -z "$queue_dir" ]]; then
+        printf 'queue_directory: unknown; cannot determine whether the maps are visible inside the jail\n'
+        return 0
+    fi
+    printf 'queue_directory: %s\n' "$queue_dir"
+    jail="${queue_dir%/}$MXB_MAPS_DIR"
+    if [[ -e "$jail/relay_recipients.db" ]]; then
+        printf 'maps visible inside the jail: yes (%s)\n' "$jail"
+    else
+        printf 'maps visible inside the jail: no (%s missing)\n' "$jail"
+        printf 'a chrooted smtpd cannot read %s; the supported fix is chroot=n for that service:\n' "$MXB_MAPS_DIR"
+        printf '  postconf -F smtp/inet/chroot=n && postfix reload\n'
+    fi
+}
+
+map_consistency_block() {
+    local tmp="$TMP_DIR/maps" missing extra count
+    if [[ ! -r "$MXB_MAPS_DIR/relay_domains" || ! -r "$MXB_MAPS_DIR/transport" ]]; then
+        printf 'relay_domains or transport is missing\n'
+        return 0
+    fi
+    awk '{print $1}' "$MXB_MAPS_DIR/relay_domains" | sort -u >"$tmp.rd"
+    awk '{print $1}' "$MXB_MAPS_DIR/transport" | sort -u >"$tmp.tr"
+    count=$(wc -l <"$tmp.rd" | tr -d ' ')
+    missing=$(comm -23 "$tmp.rd" "$tmp.tr" | tr '\n' ' ')
+    extra=$(comm -13 "$tmp.rd" "$tmp.tr" | tr '\n' ' ')
+    printf 'relay_domains keys: %s\ntransport keys: %s\n' "$count" "$(wc -l <"$tmp.tr" | tr -d ' ')"
+    if [[ -z "${missing// /}" ]]; then
+        printf 'domains without a transport entry (would loop to this host): none\n'
+    else
+        printf 'domains without a transport entry (would loop to this host): %s\n' "$missing"
+    fi
+    [[ -z "${extra// /}" ]] || printf 'transport entries without a relay domain: %s\n' "$extra"
+    printf 'smtp_tls_policy: '
+    if [[ -r "$MXB_MAPS_DIR/smtp_tls_policy" ]]; then
+        tr -s '[:space:]' ' ' <"$MXB_MAPS_DIR/smtp_tls_policy"
+        printf '\n'
+    else
+        printf 'missing\n'
+    fi
+}
+
+delivery_evidence_block() {
+    local log=/var/log/mail.log sent
+    if [[ ! -r "$log" ]]; then
+        printf '%s is not readable\n' "$log"
+        return 0
+    fi
+    sent=$(grep -c 'status=sent' "$log" 2>/dev/null || true)
+    printf 'successful outbound deliveries recorded: %s\n' "${sent:-0}"
+    if [[ "${sent:-0}" -eq 0 ]]; then
+        printf 'the forward path has not carried mail yet: acceptance is proven by the RCPT probe, delivery is not\n'
+    else
+        grep 'status=sent' "$log" | tail -n 3
+    fi
+}
+
+primary_smtp_tls_block() {
+    local name out rc=0 target
+    name=${SMTP_TLS_MATCH_HOSTNAME:-$MAILCOW_HOST}
+    if [[ -z "$MAILCOW_PRIMARY_IP" ]]; then
+        printf 'not configured: MAILCOW_PRIMARY_IP is empty\n'
+        return 0
+    fi
+    if [[ "$MAILCOW_PRIMARY_IP" == *:* ]]; then
+        target="[$MAILCOW_PRIMARY_IP]:${MAILCOW_PRIMARY_PORT:-25}"
+    else
+        target="${MAILCOW_PRIMARY_IP}:${MAILCOW_PRIMARY_PORT:-25}"
+    fi
+    printf 'policy mode: %s\ncertificate name: %s\ntarget: %s\n' "${SMTP_TLS_MODE:-unknown}" "${name:-unknown}" "$target"
+    out=$(timeout 15 openssl s_client -starttls smtp -connect "$target" \
+        -servername "$name" -verify_hostname "$name" -verify_return_error \
+        </dev/null 2>&1) || rc=$?
+    printf 'openssl_exit: %s\n' "$rc"
+    if printf '%s' "$out" | grep -q 'BEGIN CERTIFICATE'; then
+        printf '%s\n' "$out" | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' \
+            | openssl x509 -noout -subject -issuer -dates -checkhost "$name" 2>&1 || true
+    fi
+    printf '%s\n' "$out" | grep -aE 'Verify return code|verify error|no peer certificate|STARTTLS' | head -n 3 || true
+}
+
 section_postfix() {
     h2 "2. Postfix"
     h3 "Postfix status"
@@ -274,6 +458,32 @@ section_postfix() {
     run_block "Effective configuration (postconf -n)" postconf -n
     run_block "Enabled services (postconf -M)" postconf -M
     run_block "Listening TCP sockets" ss -ltn
+
+    h3 "Inbound TLS (port 25)"
+    banner
+    inbound_tls_block | sanitize >>"$REPORT"
+    printf '~~~\n' >>"$REPORT"
+
+    h3 "Postfix chroot and map visibility"
+    banner
+    chroot_visibility_block | sanitize >>"$REPORT"
+    printf '~~~\n' >>"$REPORT"
+
+    h3 "Local recipient acceptance (RCPT probe)"
+    banner
+    local_recipient_probe | sanitize >>"$REPORT"
+    printf '~~~\n' >>"$REPORT"
+
+    h3 "Forward-hop TLS verification"
+    banner
+    primary_smtp_tls_block | sanitize >>"$REPORT"
+    printf '~~~\n' >>"$REPORT"
+
+    h3 "Delivery evidence"
+    banner
+    delivery_evidence_block | sanitize >>"$REPORT"
+    printf '~~~\n' >>"$REPORT"
+
     h3 "Queue summary"
     banner
     queue_summary | sanitize >>"$REPORT"
@@ -357,6 +567,11 @@ section_sync() {
     maps_block >>"$REPORT"
     printf '~~~\n' >>"$REPORT"
 
+    h3 "Map consistency"
+    banner
+    map_consistency_block | sanitize >>"$REPORT"
+    printf '~~~\n' >>"$REPORT"
+
     run_block "Timer configuration" systemctl list-timers --all --no-pager
     run_block "Next and last timer run" systemctl show mailcow-sync.timer -p ActiveState -p NextElapseUSecRealtime -p LastTriggerUSec
     run_block "Timer enabled" systemctl is-enabled mailcow-sync.timer
@@ -380,15 +595,16 @@ section_connectivity() {
     fi
     printf '~~~\n' >>"$REPORT"
 
-    run_block "DNS resolution of the Mailcow host" getent hosts "$MAILCOW_HOST"
+    run_shell_block "DNS resolution of the Mailcow host" \
+        "getent ahosts '${MAILCOW_HOST}' 2>&1 | awk '{ print \$1 }' | sort -u || true"
 
     if [[ -n "$MAILCOW_HOST" && -n "$MAILCOW_API_KEY" ]] && have curl; then
         h3 "Mailcow API reachability"
         banner
-        local code rc=0
+        local code rc=0 verify http_code
         local -a args=(--silent --show-error --proto '=https' --tlsv1.2
             --connect-timeout 8 --max-time 20
-            --output /dev/null --write-out 'http_code=%{http_code} time_total=%{time_total}s tls_verify=%{ssl_verify_result}')
+            --output /dev/null --write-out 'http_code=%{http_code} time_total=%{time_total}s ssl_verify_result=%{ssl_verify_result}')
         if [[ -n "${MAILCOW_API_CA_FILE:-}" ]]; then
             args+=(--cacert "$MAILCOW_API_CA_FILE")
         fi
@@ -396,6 +612,19 @@ section_connectivity() {
             "$MAILCOW_HOST" "$MAILCOW_API_KEY" \
             | curl "${args[@]}" --config - 2>"$TMP_DIR/curl.err") || rc=$?
         printf '%s curl_exit=%s\n' "$code" "$rc" | sanitize >>"$REPORT"
+        http_code=$(printf '%s\n' "$code" | sed -n 's/.*http_code=\([0-9][0-9]*\).*/\1/p')
+        case "$code" in
+            *"ssl_verify_result=0"*)
+                if (( rc == 0 )) && [[ "$http_code" =~ ^[1-9][0-9][0-9]$ ]]; then
+                    verify="ok (ssl_verify_result 0 means the chain verified)"
+                else
+                    verify="unknown (curl exited $rc before a TLS response; http_code=${http_code:-unknown})"
+                fi
+                ;;
+            *"ssl_verify_result="*)  verify="failed (curl exited $rc)" ;;
+            *)                        verify="unknown (no TLS handshake completed)" ;;
+        esac
+        printf 'tls_verify: %s\n' "$verify" >>"$REPORT"
         sanitize <"$TMP_DIR/curl.err" >>"$REPORT" || true
         printf '~~~\n' >>"$REPORT"
     fi
@@ -450,22 +679,43 @@ smtp_probe() {
 
 certificate_block() {
     local host=$1 out="$TMP_DIR/tls.txt" cert="$TMP_DIR/tls.pem"
+    local addr family cert_seen=0 connect_target
+    local -a addresses=()
     if ! have timeout; then
         printf 'timeout not available; cannot probe TLS\n'
         return 0
     fi
-    timeout 15 openssl s_client -connect "$host:443" -servername "$host" \
-        </dev/null >"$out" 2>&1 || true
-    sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' \
-        "$out" >"$cert" 2>/dev/null || true
-    if [[ -s "$cert" ]]; then
-        openssl x509 -noout -subject -issuer -dates -in "$cert" 2>&1 || true
-        return 0
+    # The host may be reachable over one address family only; probing a single
+    # resolved address reports a false negative when that family is broken.
+    if have getent; then
+        mapfile -t addresses < <(resolve_addresses "$host")
     fi
-    printf 'no certificate received from %s:443\n' "$host"
-    # Surface the TLS error instead of leaving an unexplained empty result.
-    grep -aiE 'connect|error|fail|unable|timeout|refused' "$out" 2>/dev/null \
-        | head -n 5 || true
+    (( ${#addresses[@]} )) || addresses=("$host")
+    for addr in "${addresses[@]}"; do
+        family=IPv4
+        [[ "$addr" == *:* ]] && family=IPv6
+        if [[ "$family" == "IPv6" ]]; then
+            connect_target="[$addr]:443"
+        else
+            connect_target="$addr:443"
+        fi
+        : >"$out"
+        timeout 10 openssl s_client -connect "$connect_target" -servername "$host" \
+            </dev/null >"$out" 2>&1 || true
+        sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' \
+            "$out" >"$cert" 2>/dev/null || true
+        if [[ -s "$cert" ]]; then
+            printf 'address: %s (%s)\n' "$addr" "$family"
+            openssl x509 -noout -subject -issuer -dates -in "$cert" 2>&1 || true
+            cert_seen=1
+            continue
+        fi
+        printf 'no certificate from %s:443 (%s)\n' "$addr" "$family"
+        grep -aiE 'connect|error|fail|unable|timeout|refused|wrong version' "$out" 2>/dev/null \
+            | head -n 3 || true
+    done
+    (( cert_seen == 1 )) \
+        || printf 'no certificate received from %s:443 on any resolved address (checked: %s)\n' "$host" "${addresses[*]}"
 }
 
 section_security() {
@@ -576,6 +826,8 @@ Do the following, in order:
    - missing or stale maps, failed or partial synchronizations, relaxed mode,
    - queue growth, deferrals, expired messages, disk or resource pressure,
    - API/SMTP connectivity and TLS problems, certificate expiry,
+   - inbound STARTTLS state, outbound TLS verification, and whether a chrooted
+     smtpd can read the relay maps (see the RCPT probe and chroot sections),
    - failed package updates, pending reboots, failed systemd units.
 4. Prioritize recommendations as critical, high, medium or low. For each one,
    give the exact non-destructive command or configuration line to verify the
@@ -610,6 +862,170 @@ generate_report() {
     printf 'Attach this file to your AI assistant together with a description of the observed symptoms.\n' >>"$REPORT"
 }
 
+# ---------------------------------------------------------------------------
+# Terminal summary
+# ---------------------------------------------------------------------------
+human_duration() {
+    local seconds=$1
+    if (( seconds < 60 )); then
+        printf '%ds' "$seconds"
+    elif (( seconds < 3600 )); then
+        printf '%dm' "$((seconds / 60))"
+    elif (( seconds < 86400 )); then
+        printf '%dh %dm' "$((seconds / 3600))" "$(((seconds % 3600) / 60))"
+    else
+        printf '%dd %dh' "$((seconds / 86400))" "$(((seconds % 86400) / 3600))"
+    fi
+}
+
+human_kbytes() {
+    local value=$1
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$value"
+        return 0
+    fi
+    if (( value >= 1048576 )); then
+        printf '%dG' "$((value / 1048576))"
+    elif (( value >= 1024 )); then
+        printf '%dM' "$((value / 1024))"
+    else
+        printf '%dK' "$value"
+    fi
+}
+
+# A short, non-technical block printed after the report. The full report remains
+# the evidence; this answers "is it working right now?" without reading it.
+print_health_summary() {
+    local state="$MXB_STATE_DIR/state/sync-state.json"
+    local host postfix timer queue
+    local status="missing" source="unknown" relaxed="false"
+    local domains="?" mailboxes="?" api_epoch=0 last_sync="never"
+    local inbound="disabled (no certificate)" outbound="not configured"
+    local disk="unknown" disk_use="" disk_avail=""
+    local cert key record age now queue_dir
+    local -a attention=()
+
+    host=${BACKUP_MX_HOSTNAME:-}
+    if [[ -z "$host" ]]; then
+        host=$(hostname -f 2>/dev/null || hostname 2>/dev/null || printf 'unknown')
+    fi
+
+    postfix=$(systemctl is-active postfix 2>/dev/null || true)
+    [[ -n "$postfix" ]] || postfix="unknown"
+    timer=$(systemctl is-active mailcow-sync.timer 2>/dev/null || true)
+    [[ -n "$timer" ]] || timer="unknown"
+    queue=$(postqueue -j 2>/dev/null | awk 'END { print NR + 0 }') || queue="?"
+    [[ "$queue" =~ ^[0-9]+$ ]] || queue="?"
+
+    if [[ -r "$state" ]]; then
+        if have jq; then
+            record=$(jq -r '[.status // "unknown", .source // "unknown",
+                ((.relaxed // false) | tostring),
+                ((.counts.domains // "?") | tostring),
+                ((.counts.mailboxes // "?") | tostring),
+                ((.last_api_success_epoch // 0) | tostring)] | @tsv' "$state" 2>/dev/null || true)
+            if [[ -n "$record" ]]; then
+                IFS=$'\t' read -r status source relaxed domains mailboxes api_epoch <<<"$record" || true
+            else
+                status="unreadable"
+            fi
+        else
+            status="unreadable (jq missing)"
+        fi
+    fi
+
+    if [[ "$api_epoch" =~ ^[0-9]+$ ]] && (( api_epoch > 0 )); then
+        now=$(date +%s)
+        age=$((now - api_epoch))
+        (( age >= 0 )) || age=0
+        last_sync="$status via $source, $(human_duration "$age") ago"
+    elif [[ "$status" != "missing" && "$status" != "unreadable"* ]]; then
+        last_sync="$status via $source, time unknown"
+    fi
+
+    cert=$(postconf -h smtpd_tls_cert_file 2>/dev/null || true)
+    key=$(postconf -h smtpd_tls_key_file 2>/dev/null || true)
+    if [[ -n "$cert" && -n "$key" ]]; then
+        inbound="enabled"
+    fi
+
+    case "${SMTP_TLS_MODE:-}" in
+        secure) outbound="secure (verified as ${SMTP_TLS_MATCH_HOSTNAME:-unknown})" ;;
+        may) outbound="may (unverified)" ;;
+        "") outbound="not configured" ;;
+        *) outbound=$SMTP_TLS_MODE ;;
+    esac
+
+    if have df; then
+        queue_dir=$(postconf -h queue_directory 2>/dev/null || true)
+        if [[ -z "$queue_dir" ]]; then
+            queue_dir=$(postconf -d -h queue_directory 2>/dev/null || true)
+        fi
+        if [[ -n "$queue_dir" ]]; then
+            read -r disk_use disk_avail < <(df -Pk "$queue_dir" 2>/dev/null \
+                | awk 'NR == 2 { gsub(/%/, "", $5); print $5, $4 }') || true
+        fi
+        if [[ -n "$disk_use" && -n "$disk_avail" ]]; then
+            disk="${disk_use}% used, $(human_kbytes "$disk_avail") free"
+        fi
+    fi
+
+    if [[ "$postfix" != "active" ]]; then
+        attention+=("Postfix is not running")
+    fi
+    if [[ "$timer" != "active" ]]; then
+        attention+=("the two-hour synchronization timer is not active")
+    fi
+    if [[ "$status" == "missing" || "$status" == "unreadable"* ]]; then
+        attention+=("no synchronization has completed yet")
+    else
+        if [[ "$status" == "error" ]]; then
+            attention+=("the last synchronization failed; read $state")
+        elif [[ "$status" == "degraded" ]]; then
+            attention+=("Mailcow was unreachable; the maps come from cache")
+        fi
+        if [[ "$relaxed" == "true" ]]; then
+            attention+=("recipient validation is relaxed after a prolonged outage")
+        fi
+        if [[ "$api_epoch" =~ ^[0-9]+$ ]] && (( api_epoch > 0 )); then
+            age=$(( $(date +%s) - api_epoch ))
+            if (( age > 14400 )); then
+                attention+=("the last successful Mailcow sync is over 4 hours old")
+            fi
+        else
+            attention+=("Mailcow has never been reached successfully")
+        fi
+    fi
+    if [[ "$inbound" != "enabled" ]]; then
+        attention+=("inbound STARTTLS is disabled; senders enforcing MTA-STS or DANE cannot deliver")
+    fi
+    if [[ "$disk_use" =~ ^[0-9]+$ ]] && (( disk_use >= 90 )); then
+        attention+=("the queue filesystem is ${disk_use}% full")
+    fi
+
+    printf '\nHealth summary (version %s)\n\n' "$VERSION"
+    printf '  %-21s %s\n' "Host:" "$host"
+    printf '  %-21s %s\n' "Postfix:" "$postfix"
+    printf '  %-21s %s\n' "Queue:" "$queue $([[ "$queue" == "1" ]] && printf message || printf messages)"
+    printf '  %-21s %s\n' "Sync timer:" "$timer"
+    printf '  %-21s %s\n' "Last sync:" "$last_sync"
+    printf '  %-21s %s\n' "Domains / mailboxes:" "$domains / $mailboxes"
+    printf '  %-21s %s\n' "Inbound STARTTLS:" "$inbound"
+    printf '  %-21s %s\n' "Outbound SMTP TLS:" "$outbound"
+    printf '  %-21s %s\n' "Queue disk:" "$disk"
+    if (( ${#attention[@]} == 0 )); then
+        printf '  %-21s %s\n' "Assessment:" "healthy - no obvious problems detected"
+    else
+        printf '  %-21s %s\n' "Assessment:" "needs attention"
+        printf '  %s\n' "Attention:"
+        local item
+        for item in "${attention[@]}"; do
+            printf '    - %s\n' "$item"
+        done
+    fi
+    printf '\n'
+}
+
 main() {
     parse_args "$@"
     load_config
@@ -621,6 +1037,9 @@ main() {
 
     if [[ "$TO_STDOUT" -eq 1 ]]; then
         cat "$REPORT"
+        # Keep the report stream pipeable; the summary is still visible on the
+        # terminal when --stdout is redirected to a file.
+        print_health_summary >&2
         exit 0
     fi
 
@@ -629,6 +1048,7 @@ main() {
     target="$OUT_DIR/health-$(date -u '+%Y%m%dT%H%M%SZ').md"
     umask 077
     install -m 0600 "$REPORT" "$target"
+    print_health_summary
     printf '%s\n' "$target"
 }
 

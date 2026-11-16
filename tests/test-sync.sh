@@ -154,4 +154,13 @@ sync_once
 assert_status 1 "numeric TLD must still be rejected"
 assert_contains "$(cat "$MXB_LOG_DIR/sync.log")" "invalid entries" "invalid entries must be reported"
 
+begin "an unsynchronized clock is reported without blocking the sync"
+reset_runtime
+use_fixtures full
+export MOCK_NTPSYNC=no
+sync_once
+assert_status 0 "the sync must still run"
+assert_contains "$(cat "$MXB_LOG_DIR/sync.log")" "clock is not synchronized" "the skew must be logged"
+export MOCK_NTPSYNC=yes
+
 finish

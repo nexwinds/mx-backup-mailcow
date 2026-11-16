@@ -63,9 +63,10 @@ VERSION=${VERSION//[[:space:]]/}
 
 for file in \
     install.sh sync-mailcow.sh update.sh diagnose.sh update-scripts.sh \
-    README.md CHANGELOG.md LICENSE VERSION \
+    README.md OPERATIONS.md TROUBLESHOOTING.md DOCS.md CHANGELOG.md LICENSE VERSION \
     systemd/mailcow-sync.service systemd/mailcow-sync.timer \
-    config/config.example logrotate/mailcow-backup-mx; do
+    config/config.example logrotate/mailcow-backup-mx \
+    mailcow/allowlist-backup-mx.sh; do
     [[ -f "$SOURCE_DIR/$file" ]] || die "missing required file: $file"
 done
 
@@ -74,7 +75,7 @@ OUT_DIR=$(cd "$OUT_DIR" && pwd)
 STAGE="$OUT_DIR/mx-backup-mailcow-$VERSION"
 
 rm -rf -- "$STAGE"
-install -d -m 0755 "$STAGE/bin" "$STAGE/systemd" "$STAGE/share/doc" "$STAGE/config" "$STAGE/logrotate"
+install -d -m 0755 "$STAGE/bin" "$STAGE/systemd" "$STAGE/share/doc" "$STAGE/share/mailcow" "$STAGE/config" "$STAGE/logrotate"
 
 for script in install.sh sync-mailcow.sh update.sh diagnose.sh update-scripts.sh; do
     install -m 0755 "$SOURCE_DIR/$script" "$STAGE/bin/$script"
@@ -83,10 +84,14 @@ install -m 0644 "$SOURCE_DIR/VERSION" "$STAGE/VERSION"
 install -m 0644 "$SOURCE_DIR/systemd/mailcow-sync.service" "$STAGE/systemd/mailcow-sync.service"
 install -m 0644 "$SOURCE_DIR/systemd/mailcow-sync.timer" "$STAGE/systemd/mailcow-sync.timer"
 install -m 0644 "$SOURCE_DIR/README.md" "$STAGE/share/doc/README.md"
+install -m 0644 "$SOURCE_DIR/OPERATIONS.md" "$STAGE/share/doc/OPERATIONS.md"
+install -m 0644 "$SOURCE_DIR/TROUBLESHOOTING.md" "$STAGE/share/doc/TROUBLESHOOTING.md"
+install -m 0644 "$SOURCE_DIR/DOCS.md" "$STAGE/share/doc/DOCS.md"
 install -m 0644 "$SOURCE_DIR/CHANGELOG.md" "$STAGE/share/doc/CHANGELOG.md"
 install -m 0644 "$SOURCE_DIR/LICENSE" "$STAGE/share/doc/LICENSE"
 install -m 0644 "$SOURCE_DIR/config/config.example" "$STAGE/config/config.example"
 install -m 0644 "$SOURCE_DIR/logrotate/mailcow-backup-mx" "$STAGE/logrotate/mailcow-backup-mx"
+install -m 0755 "$SOURCE_DIR/mailcow/allowlist-backup-mx.sh" "$STAGE/share/mailcow/allowlist-backup-mx.sh"
 printf '%s\n' "$VERSION" >"$STAGE/VERSION"
 
 # Inner manifest: every file except the manifest itself.

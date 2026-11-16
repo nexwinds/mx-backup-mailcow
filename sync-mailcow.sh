@@ -139,6 +139,18 @@ require_root() {
     [[ "$(id -u)" -eq 0 ]] || die "must be run as root"
 }
 
+# A sync is safe to run with a skewed clock (Postfix does not need it for
+# routing), but the cache age, the relaxation threshold and the state
+# timestamps all depend on it, so the operator must be told.
+check_clock() {
+    command -v timedatectl >/dev/null 2>&1 || return 0
+    local state
+    state=$(timedatectl show -p NTPSynchronized --value 2>/dev/null | tr -d '[:space:]' || true)
+    [[ "$state" == "yes" ]] && return 0
+    warn "the system clock is not synchronized (state: ${state:-unknown}); cache age, RELAX_AFTER_DAYS and timestamps may be wrong. Check: timedatectl timesync-status"
+    return 0
+}
+
 prepare_dirs() {
     mkdir -p "$MXB_LOG_DIR" "$STATE_DIR" "$CACHE_DIR" "$RUN_DIR" "$TMP_DIR" \
         "$MXB_MAPS_DIR" "$MXB_BACKUP_DIR"
@@ -184,10 +196,16 @@ load_config() {
     : "${MAILCOW_API_KEY:?}"
     : "${MAILCOW_PRIMARY_IP:?}"
     : "${MAILCOW_PRIMARY_PORT:=25}"
-    : "${SMTP_TLS_MODE:=may}"
+    : "${SMTP_TLS_MODE:=secure}"
     : "${SMTP_TLS_MATCH_HOSTNAME:=}"
     : "${EXCLUDE_DOMAINS:=}"
     : "${RELAX_AFTER_DAYS:=7}"
+
+    # An empty match name would silently turn the forward hop into unverified
+    # opportunistic TLS; the primary's certificate is issued for its own name.
+    if [[ "$SMTP_TLS_MODE" == "secure" && -z "$SMTP_TLS_MATCH_HOSTNAME" ]]; then
+        SMTP_TLS_MATCH_HOSTNAME=$MAILCOW_HOST
+    fi
 }
 
 is_domain() { [[ $1 =~ $RE_DOMAIN ]]; }
@@ -240,17 +258,21 @@ validate_config() {
 postfix_uses_maps() {
     [[ "$NO_POSTFIX_CHECK" -eq 1 ]] && return 0
     command -v postconf >/dev/null 2>&1 || { warn "postconf not found, skipping Postfix map check"; return 0; }
-    local value
-    value=$(postconf -h relay_recipient_maps 2>/dev/null || true)
-    case "$value" in
-        *"$MXB_MAPS_DIR/relay_recipients"*) ;;
-        *) die "Postfix does not reference $MXB_MAPS_DIR/relay_recipients (run install.sh)" ;;
-    esac
-    value=$(postconf -h relay_domains 2>/dev/null || true)
-    case "$value" in
-        *"$MXB_MAPS_DIR/relay_domains"*) ;;
-        *) die "Postfix does not reference $MXB_MAPS_DIR/relay_domains (run install.sh)" ;;
-    esac
+    local parameter map value
+    for parameter in relay_domains relay_recipient_maps transport_maps smtp_tls_policy_maps; do
+        case "$parameter" in
+            relay_domains) map=relay_domains ;;
+            relay_recipient_maps) map=relay_recipients ;;
+            transport_maps) map=transport ;;
+            smtp_tls_policy_maps) map=smtp_tls_policy ;;
+            *) die "internal error: no map name for $parameter" ;;
+        esac
+        value=$(postconf -h "$parameter" 2>/dev/null || true)
+        case "$value" in
+            *"$MXB_MAPS_DIR/$map"*) ;;
+            *) die "Postfix parameter $parameter does not reference $MXB_MAPS_DIR/$map (found '${value:-empty}'); run install.sh" ;;
+        esac
+    done
     return 0
 }
 
@@ -587,6 +609,16 @@ validate_maps() {
             || die "invalid smtp_tls_policy line: $line"
     done <"$build/smtp_tls_policy"
 
+    # A relay domain without a transport entry falls back to MX resolution,
+    # which points at this host: mail would loop instead of reaching the primary.
+    local uncovered
+    uncovered=$(awk -F'\t' '
+        NR == FNR { transport[$1] = 1; next }
+        !($1 in transport) { print $1 }
+    ' "$build/transport" "$build/relay_domains")
+    [[ -z "$uncovered" ]] \
+        || die "relay domains without a transport entry (mail would loop back to this host): ${uncovered//$'\n'/, }"
+
     if [[ ! -s "$build/relay_domains" && "$ALLOW_EMPTY" -ne 1 ]]; then
         die "generated relay_domains map is empty"
     fi
@@ -857,6 +889,7 @@ main() {
     prepare_dirs
     load_config
     validate_config
+    check_clock
 
     if [[ -n "$ROLLBACK_TARGET" ]]; then
         acquire_lock

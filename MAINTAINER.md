@@ -1,8 +1,9 @@
 # mx-backup-mailcow — maintainer guide
 
 Audience: whoever cuts and publishes releases. For operating a server, see
-[`README.md`](README.md); for lookup material, see [`DOCS.md`](DOCS.md); for
-development, tests and pull request rules, see
+[`README.md`](README.md) and [`OPERATIONS.md`](OPERATIONS.md); for fixes, see
+[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md); for lookup material, see
+[`DOCS.md`](DOCS.md); for development, tests and pull request rules, see
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Project status
@@ -19,11 +20,12 @@ application is declared stable. Consequences while in this state:
 ## Repository layout
 
 ```text
-VERSION  README.md  DOCS.md  CONTRIBUTING.md
-MAINTAINER.md  CHANGELOG.md  CODE_OF_CONDUCT.md  LICENSE  Makefile
-package.json  bunfig.toml  .editorconfig
+VERSION  README.md  OPERATIONS.md  TROUBLESHOOTING.md  DOCS.md
+CONTRIBUTING.md  MAINTAINER.md  CHANGELOG.md  CODE_OF_CONDUCT.md  LICENSE
+Makefile  package.json  bunfig.toml  .editorconfig
 install.sh  sync-mailcow.sh  update.sh  diagnose.sh  update-scripts.sh
 systemd/  config/  logrotate/  scripts/build-release.sh
+mailcow/allowlist-backup-mx.sh
 tests/  .github/workflows/  .github/ISSUE_TEMPLATE/  .github/PULL_REQUEST_TEMPLATE.md
 ```
 
@@ -37,9 +39,12 @@ This is the source tree. The paths a deployed server has are in
 | `update.sh`                        | Ubuntu package updates (`mx-update`)                                                              |
 | `diagnose.sh`                      | read-only health report (`mx-diagnose`)                                                           |
 | `update-scripts.sh`                | self-updater from Releases (`mx-update-scripts`)                                                  |
+| `mailcow/allowlist-backup-mx.sh`   | Mailcow-side allowlist, run on the Mailcow host (shipped in `share/mailcow/`)                     |
 | `scripts/build-release.sh`         | reproducible release archive + manifests                                                          |
 | `tests/`                           | offline test suite with mocked commands                                                           |
 | `CONTRIBUTING.md`                  | what an outside contributor needs: scope, setup, tests, PR rules                                  |
+| `OPERATIONS.md`                    | procedures: installation, health report, architecture, DNS, configuration, maintenance, security  |
+| `TROUBLESHOOTING.md`               | symptom table, terminal-summary verdicts, diagnostics, report section map                         |
 | `DOCS.md`                          | lookup material: runtime paths, configuration keys, script flags, map tables, verification checks |
 | `CODE_OF_CONDUCT.md`               | Contributor Covenant 2.1                                                                          |
 | `.github/workflows/ci.yml`         | lint, tests, release build on every push/PR                                                       |
@@ -121,7 +126,7 @@ cat dist/SHA256SUMS
 `scripts/build-release.sh` produces:
 
 ```text
-dist/mx-backup-mailcow-<version>.tar.gz   staged tree: bin/, systemd/, share/doc/, config/, logrotate/
+dist/mx-backup-mailcow-<version>.tar.gz   staged tree: bin/, systemd/, share/doc/, share/mailcow/, config/, logrotate/
 dist/SHA256SUMS                           checksums for the archive and install.sh
 dist/install.sh                           standalone bootstrap installer
 ```
@@ -129,13 +134,12 @@ dist/install.sh                           standalone bootstrap installer
 Details that matter when modifying the build:
 
 - the staged tree must contain `bin/{install,sync-mailcow,update,diagnose,update-scripts}.sh`,
-  `VERSION`, both systemd units, `share/doc/README.md`, `share/doc/CHANGELOG.md`,
-  `share/doc/LICENSE` (no extension), `config/config.example` and
-  `logrotate/mailcow-backup-mx`;
-- `DOCS.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` and `MAINTAINER.md` are
-  **not** staged yet: add them to `scripts/build-release.sh` (and to the
-  expected layout in `tests/test-release.sh`) before the first release, so an
-  installed server keeps its own copy of the documentation;
+  `VERSION`, both systemd units, `share/doc/README.md`, `share/doc/OPERATIONS.md`,
+  `share/doc/TROUBLESHOOTING.md`, `share/doc/DOCS.md`, `share/doc/CHANGELOG.md`,
+  `share/doc/LICENSE` (no extension), `share/mailcow/allowlist-backup-mx.sh`,
+  `config/config.example` and `logrotate/mailcow-backup-mx`;
+- `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` and `MAINTAINER.md` are **not** staged:
+  they are contributor material, and the installed server does not need them.
 - the archive embeds its own `SHA256SUMS`, which both `install.sh` and
   `update-scripts.sh` verify after extraction;
 - archive paths must stay relative (`tar` is called with `-C` and no absolute
