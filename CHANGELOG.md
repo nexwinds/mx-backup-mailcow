@@ -6,8 +6,26 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Removed `MANUAL-SETUP.md`. The by-hand deployment path was untested, duplicated
+  the Postfix settings in `install.sh` and had begun to drift; the installer is
+  now the only supported deployment. The map-file formats and the lab
+  verification checks moved to [`DOCS.md`](DOCS.md), and the Postfix reference
+  points at the `settings` array in `install.sh` instead of repeating it.
+- CI and the release workflow use `actions/checkout@v5`, run under an 8-minute
+  job ceiling, and install `shellcheck`/`jq` only when the runner image lacks
+  them. The diagnostic test mock now reports `/dev/tcp` probes as timeouts
+  instead of opening a socket, cutting the suite from about 12 minutes to well
+  under the cap.
+
 ### Fixed
 
+- `scripts/build-release.sh` writes `dist/SHA256SUMS` with a single two-space
+  separator. The previous pattern left a leading space in the filename, which
+  made `sha256sum -c SHA256SUMS` fail in CI and for anyone verifying a
+  downloaded asset. `tests/test-release.sh` now runs `sha256sum -c` itself, so
+  the manifest is validated the way a user validates it.
 - `install.sh` now restores `/etc/postfix/main.cf` and `/etc/postfix/master.cf`
   from the package templates when the postfix package was installed with the
   "No configuration" mailer type and shipped neither file. Previously the first

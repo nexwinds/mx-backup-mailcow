@@ -50,7 +50,8 @@ writing code**. The scope rule is the reason this project is still five scripts.
 ## Before you start
 
 1. Read [`README.md`](README.md) if you are new to the project, and
-   [`MANUAL-SETUP.md`](MANUAL-SETUP.md) for what the installer actually changes.
+   [`DOCS.md`](DOCS.md#postfix) for the Postfix configuration the installer
+   applies.
 2. Search the existing issues and pull requests; a duplicate is closed quickly.
 3. For anything that is not a one-line fix, open an issue first and wait for a
    maintainer to agree on the direction. It avoids work that scope will reject.
@@ -100,12 +101,12 @@ function mock, and every path is redirected through `MXB_*` variables.
 | `tests/test-update.sh`         | success, failure reporting, dry run, reboot detection, quiet mode, no destructive calls                        |
 | `tests/test-diagnose.sh`       | AI prompt, redaction, address masking, read-only guarantees, report permissions                                |
 | `tests/test-update-scripts.sh` | check, dry run, checksum/syntax rejection, self-update verification, rollback, safety                          |
-| `tests/test-release.sh`        | archive layout, manifests, version consistency, invalid input                                                  |
+| `tests/test-release.sh`        | archive layout, manifest verification, version consistency, invalid input                                      |
 
 Because no MTA is started, recipient acceptance is verified against a simulator
 that implements the documented Postfix lookup order. Real-server acceptance is a
 manual check, documented in
-[`MANUAL-SETUP.md`](MANUAL-SETUP.md#verification).
+[`DOCS.md`](DOCS.md#verification-checks).
 
 ### Formatting
 
@@ -156,12 +157,12 @@ instead of the formatter.
 - `README.md` — what an operator reads: install, API key, health checks,
   troubleshooting.
 - `DOCS.md` — lookup material: configuration keys, script flags, map and state
-  tables, runtime paths. If you add a key, a flag or a table, it belongs here.
-- `MANUAL-SETUP.md` — what the installer actually changes, by hand. If you add
-  or rename a Postfix setting, a directory, a unit or a map, update this file.
+  tables, runtime paths, verification checks. If you add a key, a flag or a
+  table, it belongs here.
 - `MAINTAINER.md` — releases, CI internals, versioning.
 - Do not duplicate a topic across files: each fact lives in one document and the
-  others link to it. A repeated table is a review finding.
+  others link to it. A repeated table is a review finding. In particular, do not
+  copy the `postconf -e` list out of `install.sh` into prose; link to it.
 
 ### Changelog
 
@@ -185,7 +186,7 @@ type(scope): subject
 | ---------- | --------------------------------------------------------------- |
 | `feat`     | a capability the project did not have                           |
 | `fix`      | a defect in scripts, maps, units or docs that changes behaviour |
-| `docs`     | documentation, comments, README/MANUAL-SETUP/MAINTAINER text    |
+| `docs`     | documentation, comments, README/DOCS/MAINTAINER text            |
 | `test`     | tests and test helpers only                                     |
 | `refactor` | internal restructuring with no behaviour change                 |
 | `perf`     | smaller or faster output, map or report generation              |

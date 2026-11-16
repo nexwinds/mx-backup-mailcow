@@ -56,6 +56,10 @@ expected=$(awk '/mx-backup-mailcow-2.3.4.tar.gz/ {print $1}' "$WORK/out/SHA256SU
 actual=$(sha256sum "$archive" | awk '{print $1}')
 assert_eq "$actual" "$expected" "archive checksum matches the manifest"
 
+begin "outer manifest verifies the published files"
+run bash -c "cd '$WORK/out' && sha256sum -c SHA256SUMS --quiet"
+assert_status 0 "asset checksums must verify with sha256sum -c"
+
 begin "invalid versions are refused"
 run bash "$BUILDER" --source "$REPO_ROOT" --out "$WORK/bad" --version "2.3"
 assert_status 1 "invalid semantic version must be refused"

@@ -19,14 +19,13 @@ when it recovers. No Docker, no database, no extra mail server components.
 
 ## Documentation
 
-| Document                                   | Audience                                        | Contents                                                                                           |
-| ------------------------------------------ | ----------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| **README.md** (this file)                  | technician deploying or operating a server      | requirements, installation, API key, health checks, configuration, maintenance, troubleshooting    |
-| [`MANUAL-SETUP.md`](MANUAL-SETUP.md)       | whoever cannot or will not run `install.sh`     | by-hand deployment: packages, config file, Postfix maps, systemd units, log rotation, verification |
-| [`DOCS.md`](DOCS.md)                       | anyone looking up a fact                        | runtime layout, configuration keys and overrides, script flags, map and state tables               |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md)       | anyone sending a bug report, a fix or a feature | project scope, development setup, tests, code rules, commit and pull request conventions           |
-| [`MAINTAINER.md`](MAINTAINER.md)           | whoever publishes the project                   | repository layout, CI internals, building and publishing a release, deferred simplifications       |
-| [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | everyone                                        | Contributor Covenant 2.1                                                                           |
+| Document                                   | Audience                                        | Contents                                                                                                  |
+| ------------------------------------------ | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| **README.md** (this file)                  | technician deploying or operating a server      | requirements, installation, API key, health checks, configuration, maintenance, troubleshooting           |
+| [`DOCS.md`](DOCS.md)                       | anyone looking up a fact                        | runtime layout, configuration keys and overrides, script flags, map and state tables, verification checks |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md)       | anyone sending a bug report, a fix or a feature | project scope, development setup, tests, code rules, commit and pull request conventions                  |
+| [`MAINTAINER.md`](MAINTAINER.md)           | whoever publishes the project                   | repository layout, CI internals, building and publishing a release, deferred simplifications              |
+| [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | everyone                                        | Contributor Covenant 2.1                                                                                  |
 
 ## Contents
 
@@ -171,6 +170,9 @@ before mail can be relayed and synchronized.
    the backup MX serves; the backup MX synchronizes recipients directly.
 
 ## Installation
+
+`install.sh` is the only supported deployment path. There is no by-hand
+procedure to keep in sync with it.
 
 ### Interactive installation
 
@@ -400,10 +402,8 @@ determined it refuses to enable UFW rather than risk locking you out.
 Settings live in `/etc/mailcow-backup-mx/config` (owner `root`, mode `0600`).
 The installer writes it; edit it only for values the installer does not ask
 for. Every key, its default, the `MXB_*` path overrides and the Postfix
-settings the installer applies are in [`DOCS.md`](DOCS.md#configuration).
-
-To apply the same Postfix configuration by hand, including the aliases file and
-the seed maps, use [`MANUAL-SETUP.md`](MANUAL-SETUP.md#step-5--postfix).
+settings the installer applies are in [`DOCS.md`](DOCS.md#configuration); the
+authoritative Postfix list is the `settings` array in [`install.sh`](install.sh).
 
 ## Scripts
 
@@ -480,7 +480,7 @@ sudo tail -n 100 /var/log/mailcow-backup-mx/sync.log
 ```
 
 To prove that recipient validation and queue recovery actually work, use the
-lab checks in [`MANUAL-SETUP.md`](MANUAL-SETUP.md#verification).
+lab checks in [`DOCS.md`](DOCS.md#verification-checks).
 
 ## Security notes
 

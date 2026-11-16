@@ -1,13 +1,13 @@
 # mx-backup-mailcow — reference
 
 Lookup material: where files live, which configuration keys exist, what each
-flag does, and what the synchronization writes into the Postfix maps.
+flag does, what the synchronization writes into the Postfix maps, and the checks
+that prove recipient validation and queue recovery work.
 
-Nothing here is a procedure. Installing, checking health, deploying by hand,
-sending a patch and cutting a release are in
-[`README.md`](README.md), [`MANUAL-SETUP.md`](MANUAL-SETUP.md),
-[`CONTRIBUTING.md`](CONTRIBUTING.md) and [`MAINTAINER.md`](MAINTAINER.md)
-respectively. Each fact appears in exactly one document; the others link here.
+Installing and checking health are in [`README.md`](README.md); sending a patch
+and cutting a release are in [`CONTRIBUTING.md`](CONTRIBUTING.md) and
+[`MAINTAINER.md`](MAINTAINER.md). Each fact appears in exactly one document; the
+others link here.
 
 ## Runtime layout
 
@@ -55,16 +55,20 @@ All paths can be overridden with environment variables for staging or tests:
 
 ### Postfix
 
-The installer sets 43 keys with `postconf -e`. The complete list, the command
-that sets each one, the aliases that discard local operational mail, and the
-map seed files are in
-[`MANUAL-SETUP.md`](MANUAL-SETUP.md#step-5--postfix). They cover:
+`install.sh` configures Postfix with `postconf -e`; the authoritative list is the
+`settings` array in `configure_postfix()` in [`install.sh`](install.sh). The keys
+cover:
 
 - destinations, interfaces and `mynetworks`;
 - the four synchronized maps plus `aliases`;
 - relay and recipient restrictions, reject codes and `recipient_delimiter`;
 - queue lifetime, backoff, warning delay and size limits;
 - TLS security level, protocols and CA bundle.
+
+Local operational mail is discarded: an `aliases` map sends `postmaster`, `root`,
+`mailer-daemon`, `double-bounce`, `nobody`, `hostmaster`, `webmaster`, `abuse`
+and `security` to `/dev/null`. The four synchronized maps are seeded empty, so
+Postfix can start before the first synchronization.
 
 The original `main.cf` is kept once as `main.cf.pre-mx-backup-mailcow`. When
 the postfix package was installed with the "No configuration" mailer type and
@@ -236,6 +240,31 @@ Safety properties:
 
 ## Synchronization and maps
 
+### Map files
+
+The four synchronized maps are Postfix `hash:` maps: tab-separated
+`key<TAB>value`, one entry per line, indexed by `postmap`. `sync-mailcow.sh`
+writes them; edit one by hand only to repair a broken server, because the next
+synchronization rewrites it. The `aliases` map in the same directory is written
+by `install.sh` in `aliases(5)` form (`name: value`) and is never synchronized.
+After any manual edit, rebuild the index and reload Postfix:
+
+```bash
+sudo postmap hash:/etc/postfix/mailcow-backup-mx/relay_recipients
+sudo postfix reload
+```
+
+| File               | Entry                                                 | Meaning                                                       |
+| ------------------ | ----------------------------------------------------- | ------------------------------------------------------------- |
+| `relay_domains`    | `example.com<TAB>OK`                                  | domain is relayed                                             |
+| `relay_recipients` | `alice@example.com<TAB>OK`                            | exact recipient accepted                                      |
+| `relay_recipients` | `@example.com<TAB>OK`                                 | every recipient of the domain (see [Recipients](#recipients)) |
+| `transport`        | `example.com<TAB>smtp:[203.0.113.10]:25`              | delivery target is the primary IP, never MX                   |
+| `smtp_tls_policy`  | `[203.0.113.10]:25<TAB>may`                           | opportunistic TLS to the primary                              |
+| `smtp_tls_policy`  | `[203.0.113.10]:25<TAB>secure match=mail.example.com` | mandatory TLS with certificate name                           |
+
+Postfix is reloaded only when a map or its `.db` index changed.
+
 ### Domains
 
 All active Mailcow domains are relay domains and are routed to the primary IP.
@@ -287,3 +316,54 @@ no per-tag entries are needed.
 
 Logs are rotated weekly, eight files kept, compressed, by
 `/etc/logrotate.d/mailcow-backup-mx`.
+
+## Verification checks
+
+These checks require a lab or a maintenance window. They prove that recipient
+validation and queue recovery work on the deployed server; the offline test
+suite covers the same logic without an MTA.
+
+### Recipient validation
+
+From an external host:
+
+```bash
+# Known recipient: expect 250
+swaks --to alice@example.com --server mx2.example.com --quit-after RCPT
+
+# Plus addressing: expect 250
+swaks --to alice+test@example.com --server mx2.example.com --quit-after RCPT
+
+# Unknown recipient: expect 550
+swaks --to nobody@example.com --server mx2.example.com --quit-after RCPT
+
+# Unrelated domain: expect 550/554 (not a relay domain)
+swaks --to user@gmail.com --server mx2.example.com --quit-after RCPT
+```
+
+The same exchange with `telnet` or `openssl s_client`:
+
+```text
+EHLO test.local
+MAIL FROM:<sender@example.net>
+RCPT TO:<alice@example.com>
+DATA
+Subject: backup mx test
+
+test
+.
+QUIT
+```
+
+### Queue recovery
+
+1. Stop Postfix on the primary (or block TCP/25).
+2. Send a message to a valid recipient on a hosted domain.
+3. `postqueue -p` shows one deferred message.
+4. Restore the primary.
+5. Within 5–15 minutes the queue empties; or run `sudo postqueue -f`.
+6. Confirm the message in the recipient's mailbox.
+
+Because no MTA is started during development, recipient acceptance is also
+verified against a simulator that implements the documented Postfix lookup
+order; the manual SMTP checks above are the confirmation before production use.

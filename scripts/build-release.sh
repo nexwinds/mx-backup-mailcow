@@ -95,7 +95,7 @@ printf '%s\n' "$VERSION" >"$STAGE/VERSION"
     find . -type f ! -name SHA256SUMS -print0 \
         | sort -z \
         | xargs -0 sha256sum \
-        | sed -E 's|  [*]?\./|  |' \
+        | sed -E 's|^([0-9a-f]{64}) [ *]\./|\1  |' \
         >SHA256SUMS
 )
 chmod 0644 "$STAGE/SHA256SUMS"
@@ -120,8 +120,8 @@ grep -q "^VERSION=\"$VERSION\"$" "$OUT_DIR/install.sh" \
 (
     cd "$OUT_DIR"
     {
-        sha256sum "$ARCHIVE" | sed -E 's/^([0-9a-f]{64}) [*]?/\1  /'
-        sha256sum install.sh | sed -E 's/^([0-9a-f]{64}) [*]?/\1  /'
+        sha256sum "$ARCHIVE" | sed -E 's/^([0-9a-f]{64}) [ *]/\1  /'
+        sha256sum install.sh | sed -E 's/^([0-9a-f]{64}) [ *]/\1  /'
     } >SHA256SUMS
 )
 

@@ -1,9 +1,9 @@
 # mx-backup-mailcow — maintainer guide
 
 Audience: whoever cuts and publishes releases. For operating a server, see
-[`README.md`](README.md); for a deployment without the installer, see
-[`MANUAL-SETUP.md`](MANUAL-SETUP.md); for development, tests and pull request
-rules, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+[`README.md`](README.md); for lookup material, see [`DOCS.md`](DOCS.md); for
+development, tests and pull request rules, see
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Project status
 
@@ -19,7 +19,7 @@ application is declared stable. Consequences while in this state:
 ## Repository layout
 
 ```text
-VERSION  README.md  DOCS.md  MANUAL-SETUP.md  CONTRIBUTING.md
+VERSION  README.md  DOCS.md  CONTRIBUTING.md
 MAINTAINER.md  CHANGELOG.md  CODE_OF_CONDUCT.md  LICENSE  Makefile
 package.json  bunfig.toml  .editorconfig
 install.sh  sync-mailcow.sh  update.sh  diagnose.sh  update-scripts.sh
@@ -30,24 +30,24 @@ tests/  .github/workflows/  .github/ISSUE_TEMPLATE/  .github/PULL_REQUEST_TEMPLA
 This is the source tree. The paths a deployed server has are in
 [`DOCS.md`](DOCS.md#runtime-layout).
 
-| Path                               | Role                                                                         |
-| ---------------------------------- | ---------------------------------------------------------------------------- |
-| `install.sh`                       | provisioner; also the bootstrap asset of a release                           |
-| `sync-mailcow.sh`                  | API → Postfix map synchronization                                            |
-| `update.sh`                        | Ubuntu package updates (`mx-update`)                                         |
-| `diagnose.sh`                      | read-only health report (`mx-diagnose`)                                      |
-| `update-scripts.sh`                | self-updater from Releases (`mx-update-scripts`)                             |
-| `scripts/build-release.sh`         | reproducible release archive + manifests                                     |
-| `tests/`                           | offline test suite with mocked commands                                      |
-| `CONTRIBUTING.md`                  | what an outside contributor needs: scope, setup, tests, PR rules             |
-| `DOCS.md`                          | lookup material: runtime paths, configuration keys, script flags, map tables |
-| `CODE_OF_CONDUCT.md`               | Contributor Covenant 2.1                                                     |
-| `.github/workflows/ci.yml`         | lint, tests, release build on every push/PR                                  |
-| `.github/workflows/pr-title.yml`   | Conventional Commit check on pull request titles                             |
-| `.github/workflows/release.yml`    | tag-triggered release publication                                            |
-| `.github/ISSUE_TEMPLATE/`          | bug report and feature request forms                                         |
-| `.github/PULL_REQUEST_TEMPLATE.md` | pull request checklist                                                       |
-| `package.json`, `bunfig.toml`      | formatter entry points for `bun run format`; no dependencies, no CI job      |
+| Path                               | Role                                                                                              |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `install.sh`                       | provisioner; also the bootstrap asset of a release                                                |
+| `sync-mailcow.sh`                  | API → Postfix map synchronization                                                                 |
+| `update.sh`                        | Ubuntu package updates (`mx-update`)                                                              |
+| `diagnose.sh`                      | read-only health report (`mx-diagnose`)                                                           |
+| `update-scripts.sh`                | self-updater from Releases (`mx-update-scripts`)                                                  |
+| `scripts/build-release.sh`         | reproducible release archive + manifests                                                          |
+| `tests/`                           | offline test suite with mocked commands                                                           |
+| `CONTRIBUTING.md`                  | what an outside contributor needs: scope, setup, tests, PR rules                                  |
+| `DOCS.md`                          | lookup material: runtime paths, configuration keys, script flags, map tables, verification checks |
+| `CODE_OF_CONDUCT.md`               | Contributor Covenant 2.1                                                                          |
+| `.github/workflows/ci.yml`         | lint, tests, release build on every push/PR                                                       |
+| `.github/workflows/pr-title.yml`   | Conventional Commit check on pull request titles                                                  |
+| `.github/workflows/release.yml`    | tag-triggered release publication                                                                 |
+| `.github/ISSUE_TEMPLATE/`          | bug report and feature request forms                                                              |
+| `.github/PULL_REQUEST_TEMPLATE.md` | pull request checklist                                                                            |
+| `package.json`, `bunfig.toml`      | formatter entry points for `bun run format`; no dependencies, no CI job                           |
 
 There is no `dist/` in the tree: `make release` creates it on demand and it is
 ignored by git. Release artifacts are published from CI, never committed.
@@ -72,6 +72,13 @@ covers only what a maintainer needs to cut and publish a release.
 3. `make release` into `dist/`;
 4. `sha256sum -c SHA256SUMS` on the produced assets.
 
+The job has an 8-minute ceiling (`timeout-minutes`) and pull request runs for
+the same branch are cancelled when a newer commit arrives. The test suite never
+opens a socket: the `timeout` mock reports `/dev/tcp` probes as an immediate
+timeout, so a regression cannot stretch the run by waiting for a kernel connect
+timeout. `shellcheck` and `jq` are installed only when the runner image lacks
+them.
+
 `pr-title.yml` runs on pull request `opened`, `edited`, `synchronize` and
 `reopened` events and rejects titles that are not a Conventional Commit
 (`type(scope): subject`). It uses no third-party action: the check is a Bash
@@ -81,7 +88,8 @@ Someone merging through the web UI must therefore keep the pull request title
 intact; a squash merge already uses it.
 
 `release.yml` runs only on a `v*` tag push and has write permission on
-repository contents. In order:
+repository contents. It has the same 8-minute ceiling and tool bootstrap as CI.
+In order:
 
 1. checks out the tag;
 2. verifies the tag against `VERSION` (`v<VERSION>` must equal the tag name);
@@ -124,11 +132,10 @@ Details that matter when modifying the build:
   `VERSION`, both systemd units, `share/doc/README.md`, `share/doc/CHANGELOG.md`,
   `share/doc/LICENSE` (no extension), `config/config.example` and
   `logrotate/mailcow-backup-mx`;
-- `DOCS.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `MAINTAINER.md` and
-  `MANUAL-SETUP.md` are **not** staged yet: add them to
-  `scripts/build-release.sh` (and to the expected layout in
-  `tests/test-release.sh`) before the first release, so an installed server
-  keeps its own copy of the documentation;
+- `DOCS.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` and `MAINTAINER.md` are
+  **not** staged yet: add them to `scripts/build-release.sh` (and to the
+  expected layout in `tests/test-release.sh`) before the first release, so an
+  installed server keeps its own copy of the documentation;
 - the archive embeds its own `SHA256SUMS`, which both `install.sh` and
   `update-scripts.sh` verify after extraction;
 - archive paths must stay relative (`tar` is called with `-C` and no absolute

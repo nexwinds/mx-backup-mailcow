@@ -18,7 +18,7 @@ output over raw logs.
 
 ## What you expected
 
-<!-- The behaviour documented in README.md or MANUAL-SETUP.md. Quote the line. -->
+<!-- The behaviour documented in README.md or DOCS.md. Quote the line. -->
 
 ## Steps to reproduce
 

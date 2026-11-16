@@ -471,7 +471,13 @@ apt-get() {
 
 timeout() {
     mock_log "timeout $*"
-    shift
+    shift || true
+    # diagnose.sh probes SMTP with `timeout N bash -c '... /dev/tcp/...'`.
+    # Running that for real would open a socket to a black-holed address and
+    # wait for the kernel timeout, so report an immediate timeout instead.
+    case "$*" in
+        *"/dev/tcp/"*) return 124 ;;
+    esac
     "$@"
 }
 
