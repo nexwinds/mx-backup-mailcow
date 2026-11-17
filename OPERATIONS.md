@@ -334,16 +334,63 @@ example.com.    300 IN MX 20 mx2.example.com.
 - No SPF change is needed for ordinary relayed mail, because the original
   sender's envelope is preserved.
 
-Firewall (configured by the installer):
+The firewall is enforced at two layers: the **Hetzner Cloud Firewall** in front
+of the instance and the **host UFW** that the installer configures. Apply both.
+Only the cloud firewall carries an outbound allowlist, because the installer
+leaves UFW on its default outbound policy.
 
-```text
-inbound:  TCP/22 (or your SSH port), TCP/25
-outbound: TCP/25 to the primary, TCP/443 to Mailcow and GitHub, DNS
-```
+### Hetzner Cloud Firewall
 
-The installer enables UFW with default-deny incoming. It detects the SSH port
-from `/etc/ssh/sshd_config` and `sshd_config.d/*.conf`; if no port can be
-determined it refuses to enable UFW rather than risk locking you out.
+Rules apply to both address families unless stated; keep the IPv4 and IPv6 rule
+sets identical. The firewall matches addresses and CIDRs, not hostnames, so
+resolve the names below and re-check them when an address changes.
+
+| Direction | Protocol/port  | Source → destination                  | Purpose                                                                  | Condition                                                                                                             |
+| --------- | -------------- | ------------------------------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| Inbound   | TCP 22         | any → instance                        | SSH administration                                                       | always (your SSH port if changed)                                                                                     |
+| Inbound   | TCP 25         | `0.0.0.0/0`, `::/0` → instance        | SMTP from sending MTAs                                                   | always                                                                                                                |
+| Inbound   | TCP 80         | `0.0.0.0/0`, `::/0` → instance        | ACME HTTP-01 issuance and renewal                                        | during installation; then only while a certificate is managed                                                         |
+| Inbound   | any            | any → instance                        | denied (default)                                                         | always                                                                                                                |
+| Outbound  | TCP 25         | instance → primary Mailcow IP         | relay queued mail to the primary                                         | always                                                                                                                |
+| Outbound  | TCP 25         | instance → sender/operator MX         | delay warnings, rejection and expiry bounces, forwarded operational mail | if the primary rejects a recipient, mail stays queued past `delay_warning_time` (4h), or `OPERATIONAL_MAIL_TO` is set |
+| Outbound  | TCP 443        | instance → Mailcow hostname           | Mailcow API and two-hour synchronization                                 | always                                                                                                                |
+| Outbound  | TCP 443        | instance → GitHub API and release CDN | release check and download                                               | omitted with `--local-dir`                                                                                            |
+| Outbound  | TCP 443        | instance → ACME endpoints             | Let's Encrypt issuance and renewal                                       | during installation; then only while a certificate is managed                                                         |
+| Outbound  | UDP 53, TCP 53 | instance → configured resolvers       | DNS, MX/PTR lookups, API hostname resolution                             | always                                                                                                                |
+| Outbound  | UDP 123        | instance → NTP servers                | clock synchronization (TLS validity, queue timing)                       | always                                                                                                                |
+| Outbound  | TCP 80, 443    | instance → OS package mirrors         | `apt` updates, installs and unattended security upgrades                 | during installation and whenever package updates run                                                                  |
+| Outbound  | any            | instance → any                        | denied (default)                                                         | always                                                                                                                |
+
+GitHub release downloads start at `github.com` and redirect to
+`release-assets.githubusercontent.com` (some assets still use
+`objects.githubusercontent.com`); allow the redirect host as well, or the
+download fails after the API call succeeds.
+
+Only relayed mail is pinned to the primary IP, by `transport_maps`. Notification
+traffic (delay warnings, rejection and expiry bounces) and `OPERATIONAL_MAIL_TO`
+forwarding use normal MX resolution, so they need outbound TCP/25 to the
+destination MX. Those destinations are not known in advance, so this rule has to
+allow TCP/25 to any address; pinning it to the primary breaks the notifications.
+
+### Host UFW
+
+| Direction | Rule                | Purpose              | Condition                                                     |
+| --------- | ------------------- | -------------------- | ------------------------------------------------------------- |
+| Inbound   | TCP `<SSH port(s)>` | SSH administration   | always; port detected, see below                              |
+| Inbound   | TCP 25              | SMTP backup MX       | always                                                        |
+| Inbound   | TCP 80              | ACME HTTP-01 renewal | during installation; kept only while a certificate is managed |
+| Inbound   | all other           | denied               | default deny incoming                                         |
+| Outbound  | all                 | allowed              | default allow outgoing; no explicit rules created             |
+
+The installer detects the SSH port from `/etc/ssh/sshd_config` and
+`sshd_config.d/*.conf`; if no port can be determined it refuses to enable UFW
+rather than risk locking you out. `--no-firewall` skips the UFW step entirely,
+and a host without `ufw` is left untouched with a warning.
+
+Because UFW allows all outbound traffic, an outbound restriction only exists if
+you add it to the Hetzner Cloud Firewall (or an equivalent in front of the
+host). If you change the SSH port later, update UFW and the cloud firewall
+together, or you will lose access.
 
 ## Configuration
 
