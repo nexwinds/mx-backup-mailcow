@@ -78,6 +78,7 @@ ARG_OPERATIONAL_MAIL=""
 ARG_TLS_CERT=""
 ARG_TLS_KEY=""
 ARG_NO_INBOUND_TLS=0
+INBOUND_TLS_RENEWAL=0
 
 DETECTED_FQDN=""
 
@@ -114,8 +115,11 @@ Connection options:
 Inbound TLS and operational mail:
   --inbound-tls-cert PATH   Certificate chain offered to inbound MTAs
   --inbound-tls-key PATH    Private key for --inbound-tls-cert
-                            (both default to /etc/letsencrypt/live/<hostname>/)
-  --no-inbound-tls          Do not offer STARTTLS on port 25
+                            (by default an existing certbot certificate is used;
+                            without one, install.sh requests one from Let's
+                            Encrypt when the hostname and TCP/80 allow it)
+  --no-inbound-tls          Do not offer STARTTLS on port 25 and do not request
+                            a certificate
   --operational-mail ADDR   Forward root/postmaster/abuse mail here
                             (default: discard, this server stores no mail)
 
@@ -363,8 +367,6 @@ interactive_config() {
     prompt MAILCOW_PRIMARY_IP "Primary Mailcow IP address"
     prompt MAILCOW_API_KEY "Read-only API key" 1
     prompt MAILCOW_API_CA_FILE "Private CA file for the API (optional)"
-    prompt SMTPD_TLS_CERT_FILE "Inbound TLS certificate chain (blank: no STARTTLS)"
-    prompt SMTPD_TLS_KEY_FILE "Inbound TLS private key"
     prompt OPERATIONAL_MAIL_TO "Forward root/postmaster mail to (blank: discard)"
     prompt SMTP_TLS_MODE "SMTP TLS mode for the primary (secure/may)"
 }
@@ -440,7 +442,7 @@ validate_config() {
     else
         [[ -n "$SMTPD_TLS_CERT_FILE" && -n "$SMTPD_TLS_KEY_FILE" ]] \
             || die "inbound TLS needs both SMTPD_TLS_CERT_FILE and SMTPD_TLS_KEY_FILE (use --inbound-tls-cert and --inbound-tls-key)"
-        [[ -r "$SMTPD_TLS_CERT_FILE" ]] || die "inbound TLS certificate is not readable: $SMTPD_TLS_CERT_FILE"
+        [[ -r "$SMTPD_TLS_CERT_FILE" ]] || die "inbound TLS certificate is not readable: $SMTPD_TLS_CERT_FILE (remove SMTPD_TLS_CERT_FILE/SMTPD_TLS_KEY_FILE or the --inbound-tls-* options to detect or request one automatically)"
         [[ -r "$SMTPD_TLS_KEY_FILE" ]] || die "inbound TLS private key is not readable: $SMTPD_TLS_KEY_FILE"
         if have openssl; then
             local cert_pub key_pub
@@ -845,6 +847,78 @@ postfix_compatibility_level() {
     printf '3.6'
 }
 
+# The Quick start must work on a fresh VPS, where no certificate exists yet.
+# Bring in certbot only when it is actually needed.
+ensure_certbot() {
+    have certbot && return 0
+    have apt-get || return 1
+    log "installing certbot for inbound TLS"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq >>"$MXB_LOG_DIR/install.log" 2>&1 || return 1
+    apt-get install -y -qq certbot >>"$MXB_LOG_DIR/install.log" 2>&1 || return 1
+    have certbot
+}
+
+# Obtain a certificate for the Postfix identity when none is configured. A
+# failure here is not fatal: the backup MX still accepts mail on port 25 without
+# STARTTLS, and the warning names the DNS/port-80 fix and the manual command.
+auto_provision_inbound_tls() {
+    local lesite="$MXB_LETSENCRYPT_DIR/live/$BACKUP_MX_HOSTNAME"
+    local out="" rc=0 opened_ufw=0 manual
+
+    [[ "$ARG_NO_INBOUND_TLS" -eq 1 ]] && return 0
+    [[ -n "$SMTPD_TLS_CERT_FILE" || -n "$SMTPD_TLS_KEY_FILE" ]] && return 0
+    if [[ "${MXB_SKIP_AUTO_TLS:-0}" == "1" ]]; then
+        log "automatic inbound TLS provisioning is disabled (MXB_SKIP_AUTO_TLS=1)"
+        return 0
+    fi
+    if [[ ! "$BACKUP_MX_HOSTNAME" =~ $RE_DOMAIN ]]; then
+        warn "cannot request an inbound TLS certificate for '${BACKUP_MX_HOSTNAME:-unknown}': not a fully qualified domain name"
+        return 0
+    fi
+    if [[ -r "$lesite/fullchain.pem" && -r "$lesite/privkey.pem" ]]; then
+        SMTPD_TLS_CERT_FILE="$lesite/fullchain.pem"
+        SMTPD_TLS_KEY_FILE="$lesite/privkey.pem"
+        log "using inbound TLS certificate $lesite/fullchain.pem"
+        return 0
+    fi
+
+    manual="certbot certonly --standalone -d $BACKUP_MX_HOSTNAME"
+    if have getent && ! getent ahosts "$BACKUP_MX_HOSTNAME" >/dev/null 2>&1; then
+        warn "$BACKUP_MX_HOSTNAME does not resolve; skipping the automatic certificate request. Publish its A/AAAA record, then run: $manual (or re-run install.sh)"
+        return 0
+    fi
+    if ! ensure_certbot; then
+        warn "certbot is not installed and could not be installed; continuing without inbound STARTTLS. Install it with 'apt-get install -y certbot', then run: $manual (or re-run install.sh)"
+        return 0
+    fi
+
+    log "no inbound TLS certificate found; requesting one from Let's Encrypt for $BACKUP_MX_HOSTNAME (TCP/80 must be reachable)"
+    if [[ "$NO_FIREWALL" -eq 0 ]] && have ufw \
+        && ufw status 2>/dev/null | grep -q '^Status: active' \
+        && ! ufw status 2>/dev/null | grep -q '^80/tcp'; then
+        if ufw allow 80/tcp comment 'ACME HTTP-01' >/dev/null 2>&1; then
+            opened_ufw=1
+        fi
+    fi
+    out=$(certbot certonly --standalone --preferred-challenges http \
+        --config-dir "$MXB_LETSENCRYPT_DIR" \
+        --non-interactive --agree-tos --register-unsafely-without-email \
+        --keep-until-expiring --domain "$BACKUP_MX_HOSTNAME" 2>&1) || rc=$?
+    printf '%s\n' "$out" >>"$MXB_LOG_DIR/install.log"
+
+    if [[ "$rc" -eq 0 && -r "$lesite/fullchain.pem" && -r "$lesite/privkey.pem" ]]; then
+        SMTPD_TLS_CERT_FILE="$lesite/fullchain.pem"
+        SMTPD_TLS_KEY_FILE="$lesite/privkey.pem"
+        log "obtained an inbound TLS certificate for $BACKUP_MX_HOSTNAME"
+        return 0
+    fi
+    if [[ "$opened_ufw" -eq 1 ]]; then
+        ufw delete allow 80/tcp >/dev/null 2>&1 || true
+    fi
+    warn "could not obtain an inbound TLS certificate for $BACKUP_MX_HOSTNAME (certbot exit $rc); continuing without STARTTLS. Make the name resolve here, allow TCP/80, then run: $manual (or re-run install.sh)"
+}
+
 # Postfix reads the TLS key as the unprivileged "postfix" user, so a Let's
 # Encrypt key (mode 0600 root and a 0700 parent directory) is unusable where it
 # lives. Stage the chain and key in a Postfix-readable directory, and install a
@@ -853,6 +927,7 @@ postfix_compatibility_level() {
 provision_inbound_tls() {
     local source_cert=${SMTPD_TLS_CERT_FILE:-} source_key=${SMTPD_TLS_KEY_FILE:-}
     local dir="$MXB_POSTFIX_ETC/tls" group=postfix target_cert target_key
+    INBOUND_TLS_RENEWAL=0
 
     if [[ -z "$source_cert" ]]; then
         local param
@@ -898,7 +973,10 @@ provision_inbound_tls() {
     log "inbound TLS certificate staged in $dir"
 
     case "$source_cert" in
-        "$MXB_LETSENCRYPT_DIR"/*) install_renewal_hook "$source_cert" "$source_key" "$group" ;;
+        "$MXB_LETSENCRYPT_DIR"/*)
+            INBOUND_TLS_RENEWAL=1
+            install_renewal_hook "$source_cert" "$source_key" "$group"
+            ;;
         *)
             warn "inbound TLS material is not managed by certbot; renew $source_cert and re-run install.sh before it expires"
             ;;
@@ -1144,10 +1222,15 @@ configure_firewall() {
         ufw allow "$port/tcp" comment 'SSH'
     done
     ufw allow 25/tcp comment 'SMTP backup MX'
+    local extra=""
+    if [[ "$INBOUND_TLS_RENEWAL" -eq 1 ]]; then
+        ufw allow 80/tcp comment 'ACME HTTP-01 renewal'
+        extra=", HTTP: 80 (ACME renewal)"
+    fi
     if ! ufw status | grep -q '^Status: active'; then
         ufw --force enable
     fi
-    log "firewall configured (SSH: ${ports[*]}, SMTP: 25)"
+    log "firewall configured (SSH: ${ports[*]}, SMTP: 25${extra})"
 }
 
 # TLS validity, queue lifetimes and log correlation all depend on an accurate
@@ -1382,6 +1465,34 @@ Next steps:
   4. Verify mail flow in a maintenance window:
        swaks --to <known-mailbox> --server ${BACKUP_MX_HOSTNAME:-<this-host>} --quit-after RCPT
        mx-diagnose
+EOF
+    if [[ -z "$SMTPD_TLS_CERT_FILE" ]]; then
+        if [[ "$ARG_NO_INBOUND_TLS" -eq 1 && "${MXB_SKIP_AUTO_TLS:-0}" == "1" ]]; then
+            cat <<EOF
+  5. Inbound TLS is off (--no-inbound-tls and MXB_SKIP_AUTO_TLS=1). Remove both
+     opt-outs and re-run install.sh to request a Let's Encrypt certificate
+     automatically.
+EOF
+        elif [[ "$ARG_NO_INBOUND_TLS" -eq 1 ]]; then
+            cat <<EOF
+  5. Inbound TLS is off (--no-inbound-tls). Re-run install.sh without that
+     flag to request a Let's Encrypt certificate automatically.
+EOF
+        elif [[ "${MXB_SKIP_AUTO_TLS:-0}" == "1" ]]; then
+            cat <<EOF
+  5. Inbound TLS is off and automatic issuance is disabled
+     (MXB_SKIP_AUTO_TLS=1). Unset it and re-run install.sh to request a
+     Let's Encrypt certificate automatically.
+EOF
+        else
+            cat <<EOF
+  5. Inbound TLS is off. Once ${BACKUP_MX_HOSTNAME:-<this-host>} resolves here and
+     TCP/80 is reachable, re-run install.sh: it requests a Let's Encrypt
+     certificate automatically and turns STARTTLS on.
+EOF
+        fi
+    fi
+    cat <<EOF
 
 Useful commands:
   sync-mailcow.sh --dry-run     # preview a synchronization
@@ -1430,6 +1541,7 @@ main() {
     install_application
     install_units
     install_logrotate
+    auto_provision_inbound_tls
     write_config
     configure_postfix
     configure_firewall

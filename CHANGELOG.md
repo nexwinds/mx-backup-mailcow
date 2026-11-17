@@ -31,6 +31,13 @@ project follows [Semantic Versioning](https://semver.org/).
   as the unprivileged `postfix` user. A certbot deploy hook refreshes the copy
   on renewal. `--no-inbound-tls` keeps STARTTLS off and the installer states what
   that costs.
+- Inbound TLS is automatic on a fresh host: when no certificate is configured,
+  `install.sh` requests one from Let's Encrypt (HTTP-01 standalone), stages it,
+  and allows TCP/80 through UFW for renewal. If the hostname does not resolve or
+  port 80 is unavailable, the install continues without STARTTLS and prints the
+  retry command instead of aborting. `--no-inbound-tls` or
+  `MXB_SKIP_AUTO_TLS=1` disables the request. The installer no longer prompts for
+  certificate and key paths.
 - `OPERATIONAL_MAIL_TO` forwards root/postmaster/abuse/... mail to an operator
   instead of discarding it silently.
 - Install-time verification: the clock must be synchronized, the primary's SMTP

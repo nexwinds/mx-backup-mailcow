@@ -45,8 +45,8 @@ managed keys and preserves comments and additional lines.
 | `MAILCOW_PRIMARY_PORT`    | `25`           | Primary SMTP port                                                   |
 | `SMTP_TLS_MODE`           | `secure`       | `secure` (verified) or `may` (opportunistic, unauthenticated)       |
 | `SMTP_TLS_MATCH_HOSTNAME` | `MAILCOW_HOST` | Certificate name required by `secure`                               |
-| `SMTPD_TLS_CERT_FILE`     | LE if present  | Certificate chain offered to inbound MTAs                           |
-| `SMTPD_TLS_KEY_FILE`      | LE if present  | Private key for `SMTPD_TLS_CERT_FILE`                               |
+| `SMTPD_TLS_CERT_FILE`     | auto (LE)      | Certificate chain offered to inbound MTAs                           |
+| `SMTPD_TLS_KEY_FILE`      | auto (LE)      | Private key for `SMTPD_TLS_CERT_FILE`                               |
 | `OPERATIONAL_MAIL_TO`     | empty          | Forward root/postmaster/abuse mail here; empty discards it          |
 | `EXCLUDE_DOMAINS`         | empty          | Space-separated domains to skip                                     |
 | `RELAX_AFTER_DAYS`        | `7`            | Days without API sync before accepting all recipients; `0` disables |
@@ -59,7 +59,7 @@ All paths can be overridden with environment variables for staging or tests:
 `MXB_LOGROTATE_DIR`, `MXB_POSTFIX_ETC`, `MXB_SSH_DIR`, `MXB_OS_RELEASE`,
 `MXB_REBOOT_MARKER`, `MXB_REBOOT_PKGS`, `MXB_CA_BUNDLE`, `MXB_LETSENCRYPT_DIR`,
 `MXB_RENEWAL_HOOK_DIR`, `MXB_CLOCK_WAIT_SECONDS`, `MXB_SKIP_CLOCK_CHECK`,
-`MXB_SKIP_SMTP_SELFTEST`, `MXB_SKIP_ROOT_CHECK`.
+`MXB_SKIP_SMTP_SELFTEST`, `MXB_SKIP_AUTO_TLS`, `MXB_SKIP_ROOT_CHECK`.
 
 ### Postfix
 
@@ -82,10 +82,12 @@ Three provisioning steps are verification-driven rather than cosmetic:
 - **Inbound TLS.** The chain and key are copied to
   `/etc/postfix/tls/<hostname>.{crt,key}` (`root:postfix`, mode `0644`/`0640`)
   because Postfix reads the key as the unprivileged `postfix` user, which cannot
-  read a certbot live directory. When the source is under `/etc/letsencrypt`, a
-  deploy hook in `/etc/letsencrypt/renewal-hooks/deploy/` refreshes the copy and
-  reloads Postfix on renewal. Without a certificate, port 25 runs without
-  STARTTLS and the installer says so.
+  read a certbot live directory. When no certificate is configured, the installer
+  requests one from Let's Encrypt for the Postfix hostname. When the source is
+  under `/etc/letsencrypt`, a deploy hook in
+  `/etc/letsencrypt/renewal-hooks/deploy/` refreshes the copy and reloads
+  Postfix on renewal. Without a certificate, port 25 runs without STARTTLS and
+  the installer says so.
 - **Map visibility.** A chrooted Postfix process resolves paths inside
   `$queue_directory`, so a map outside the jail is invisible to it. If the
   service runs chrooted and the maps are not present inside the jail, the
@@ -123,20 +125,28 @@ Two independent hops are configured:
 | this MX → primary (25) | `smtp_tls_policy_maps` (`smtp_tls_policy`)   | `secure match=<MAILCOW_HOST>`: certificate must verify    |
 
 Inbound: `install.sh` uses `/etc/letsencrypt/live/<hostname>/{fullchain,privkey}.pem`
-when present, or the paths given with `--inbound-tls-cert`/`--inbound-tls-key`,
-and copies them to `/etc/postfix/tls/`. To obtain the certificate and refresh
-the copy:
-
-```bash
-sudo apt-get install -y certbot
-sudo certbot certonly --standalone -d mx2.example.com    # needs TCP/80 briefly
-sudo bash install.sh --skip-upgrade                      # stages it, installs the hook
-```
+when present, or the paths given with `--inbound-tls-cert`/`--inbound-tls-key`.
+When neither exists, it installs certbot if necessary and requests a certificate
+with the HTTP-01 standalone challenge. The hostname must resolve to this server
+and TCP/80 must be reachable; the firewall keeps 80 open for renewals once a
+Let's Encrypt certificate is in use. A failed request does not abort the
+installation: port 25 is configured without STARTTLS and the warning prints the
+manual retry command. The chain and key are then copied to `/etc/postfix/tls/`.
 
 The deploy hook at `/etc/letsencrypt/renewal-hooks/deploy/mx-backup-mailcow-tls`
 copies renewed material and reloads Postfix, so no manual step is needed at
 renewal. Certificates from another CA are staged the same way but must be
-renewed by whatever issued them; re-run `install.sh` afterwards.
+renewed by whatever issued them; re-run `install.sh` afterwards. To skip
+automatic issuance on a host that obtains certificates another way, set
+`MXB_SKIP_AUTO_TLS=1`. `--no-inbound-tls` applies only to the run that uses it;
+add `MXB_SKIP_AUTO_TLS=1` to `/etc/mailcow-backup-mx/config` to skip issuance on
+later runs. An existing certificate is still adopted, so repeat
+`--no-inbound-tls` (or remove the lineage) if STARTTLS must never be offered.
+
+The ACME account is registered without a contact address, and Let's Encrypt no
+longer sends expiry reminders. Check that `certbot.timer` is active, run
+`certbot renew --dry-run` periodically (port 80 must be available), and monitor
+the certificate dates printed by `mx-diagnose`.
 
 Outbound: `SMTP_TLS_MODE=secure` is the default and is only accepted when the
 primary's certificate verifies for `SMTP_TLS_MATCH_HOSTNAME`; `may` accepts an
@@ -168,30 +178,30 @@ Provisions the server. Supports interactive and non-interactive operation,
 bootstraps releases, validates checksums and is idempotent. `--local-dir DIR`
 installs a checkout or a downloaded tree without contacting GitHub.
 
-| Option                        | Description                                                        |
-| ----------------------------- | ------------------------------------------------------------------ |
-| `--mailcow-host HOST`         | Mailcow API hostname                                               |
-| `--primary-ip IP`             | Primary Mailcow IP used for delivery                               |
-| `--api-key KEY`               | API key inline (visible in `ps`; prefer stdin)                     |
-| `--api-key-stdin`             | Read the API key from standard input                               |
-| `--ca-file PATH`              | Private CA bundle for the Mailcow API certificate                  |
-| `--smtp-tls-mode secure\|may` | Outbound TLS policy (default `secure`)                             |
-| `--tls-match HOSTNAME`        | Certificate name for `secure` mode (default: `MAILCOW_HOST`)       |
-| `--hostname FQDN`             | Postfix identity (default: `hostname -f`)                          |
-| `--inbound-tls-cert PATH`     | Certificate chain offered to inbound MTAs                          |
-| `--inbound-tls-key PATH`      | Private key for `--inbound-tls-cert`                               |
-| `--no-inbound-tls`            | Install without STARTTLS on port 25                                |
-| `--operational-mail ADDR`     | Forward root/postmaster mail to this address                       |
-| `--release VERSION`           | Install a specific release instead of the latest                   |
-| `--local-dir DIR`             | Install from a local checkout/release (offline, no release needed) |
-| `--sha256 HEX`                | Verify the installer file before running                           |
-| `--config FILE`               | Read values from a shell-style file                                |
-| `--non-interactive`           | Never prompt                                                       |
-| `--yes`                       | Skip the confirmation question                                     |
-| `--skip-upgrade`              | Do not upgrade existing Ubuntu packages                            |
-| `--skip-initial-sync`         | Do not run the first synchronization                               |
-| `--no-firewall`               | Do not configure UFW                                               |
-| `--force`                     | Proceed on otherwise fatal warnings                                |
+| Option                        | Description                                                             |
+| ----------------------------- | ----------------------------------------------------------------------- |
+| `--mailcow-host HOST`         | Mailcow API hostname                                                    |
+| `--primary-ip IP`             | Primary Mailcow IP used for delivery                                    |
+| `--api-key KEY`               | API key inline (visible in `ps`; prefer stdin)                          |
+| `--api-key-stdin`             | Read the API key from standard input                                    |
+| `--ca-file PATH`              | Private CA bundle for the Mailcow API certificate                       |
+| `--smtp-tls-mode secure\|may` | Outbound TLS policy (default `secure`)                                  |
+| `--tls-match HOSTNAME`        | Certificate name for `secure` mode (default: `MAILCOW_HOST`)            |
+| `--hostname FQDN`             | Postfix identity (default: `hostname -f`)                               |
+| `--inbound-tls-cert PATH`     | Certificate chain offered to inbound MTAs (skips the automatic request) |
+| `--inbound-tls-key PATH`      | Private key for `--inbound-tls-cert`                                    |
+| `--no-inbound-tls`            | Install without STARTTLS and skip the automatic certificate request     |
+| `--operational-mail ADDR`     | Forward root/postmaster mail to this address                            |
+| `--release VERSION`           | Install a specific release instead of the latest                        |
+| `--local-dir DIR`             | Install from a local checkout/release (offline, no release needed)      |
+| `--sha256 HEX`                | Verify the installer file before running                                |
+| `--config FILE`               | Read values from a shell-style file                                     |
+| `--non-interactive`           | Never prompt                                                            |
+| `--yes`                       | Skip the confirmation question                                          |
+| `--skip-upgrade`              | Do not upgrade existing Ubuntu packages                                 |
+| `--skip-initial-sync`         | Do not run the first synchronization                                    |
+| `--no-firewall`               | Do not configure UFW                                                    |
+| `--force`                     | Proceed on otherwise fatal warnings                                     |
 
 Re-running the installer is safe; what it preserves and how it behaves when the
 first synchronization fails is in [`OPERATIONS.md`](OPERATIONS.md#installation).

@@ -50,6 +50,11 @@ It prints a short summary and writes the full report. Read `Assessment` and the
 | `the last successful Mailcow sync is over 4 hours old` | the API or the key is failing; the server is on cache            |
 | `recipient validation is relaxed`                      | seven days without a sync; invalid recipients are rejected later |
 
+`Inbound STARTTLS: disabled` on a fresh install usually means the automatic
+Let's Encrypt request could not complete. Make the Postfix hostname resolve to
+this server, allow inbound TCP/80, then re-run `install.sh`; the installer log
+contains certbot's reason and the exact retry command.
+
 ## Diagnostics
 
 ```bash

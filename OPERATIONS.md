@@ -115,11 +115,14 @@ root, verifies Ubuntu 24.04 LTS, and then:
    because both make TLS and queue timing unreliable;
 3. updates Ubuntu packages and installs `postfix`, `jq`, `curl`, `ufw` and
    `logrotate`;
-4. writes `/etc/mailcow-backup-mx/config` with mode `0600`;
-5. configures Postfix as a backup MX, stages inbound TLS where the `postfix` user
+4. installs the scripts, systemd units and log rotation;
+5. obtains a Let's Encrypt certificate for the Postfix hostname when none is
+   configured (the hostname must resolve here and TCP/80 must be reachable),
+   then writes `/etc/mailcow-backup-mx/config` with mode `0600`;
+6. configures Postfix as a backup MX, stages inbound TLS where the `postfix` user
    can read it, and disables chroot for services that must read the maps;
-6. installs the scripts, systemd units and log rotation;
-7. configures UFW (SSH port detected automatically, plus TCP/25);
+7. configures UFW (SSH port detected automatically, plus TCP/25 and, when a
+   Let's Encrypt certificate is managed here, TCP/80 for renewals);
 8. verifies API connectivity, then verifies the primary's SMTP certificate;
 9. performs the initial synchronization and self-tests the local SMTP path
    (`RCPT` for a synchronized recipient must be accepted, an unknown one

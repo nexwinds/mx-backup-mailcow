@@ -133,6 +133,7 @@ sandbox_init() {
     export TEST_TMP
 
     export MXB_SKIP_ROOT_CHECK=1
+    export MXB_SKIP_AUTO_TLS=1
     export MXB_ETC="$TEST_TMP/etc"
     export MXB_CONFIG_FILE="$TEST_TMP/etc/config"
     export MXB_MAPS_DIR="$TEST_TMP/postfix"

@@ -53,9 +53,11 @@ when it recovers. No Docker, no database, no extra mail server components.
   certificate.
 - Inbound **TCP/25** reachable from the internet; outbound **TCP/25** to the
   primary Mailcow, plus outbound **TCP/443** to Mailcow and GitHub.
-- For inbound TLS, a certificate for the hostname (certbot is detected
-  automatically). Without one, port 25 runs without STARTTLS and senders that
-  enforce MTA-STS or DANE cannot deliver to it.
+- For inbound TLS, the installer uses an existing certificate for the hostname
+  or obtains one from Let's Encrypt with certbot. Issuance needs the hostname to
+  resolve to this server and inbound **TCP/80** reachable; keep 80 reachable so
+  renewal works. If neither is possible, the install still completes and port 25
+  runs without STARTTLS (senders enforcing MTA-STS or DANE cannot deliver).
 - Root/sudo access.
 - A Mailcow server with:
   - a **read-only API key**, restricted to the backup MX public IP
@@ -102,11 +104,20 @@ Mailcow hostname (API endpoint): mail.example.com
 Primary Mailcow IP address: 203.0.113.10
 Read-only API key:                 (input hidden)
 Private CA file for the API (optional):
-Inbound TLS certificate chain (blank: no STARTTLS): /etc/letsencrypt/live/mx2.example.com/fullchain.pem
-Inbound TLS private key: /etc/letsencrypt/live/mx2.example.com/privkey.pem
 Forward root/postmaster mail to (blank: discard):
 SMTP TLS mode for the primary (secure/may): secure
 ```
+
+Inbound TLS is automatic: if no certificate is configured, the installer asks
+Let's Encrypt for one for the Postfix hostname and stages it for Postfix. This
+happens only when the name already resolves to this server and TCP/80 is free;
+otherwise the install continues without STARTTLS and prints the one command that
+retries it later. There is no certificate path to type.
+
+`--no-inbound-tls` applies to the run that uses it. To skip automatic issuance on
+later runs, add `MXB_SKIP_AUTO_TLS=1` to `/etc/mailcow-backup-mx/config`; an
+existing certificate is still adopted, so repeat the flag if this host must never
+advertise STARTTLS.
 
 `secure` is the default because the hop that carries queued mail must
 authenticate the primary; `may` is accepted only as an explicit choice and is

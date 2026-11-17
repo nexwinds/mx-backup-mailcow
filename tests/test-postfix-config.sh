@@ -20,7 +20,7 @@ install_interactive() {
         'mail.example.com' \
         '203.0.113.10' \
         '0123456789abcdef0123456789abcdef' \
-        '' '' '' '' \
+        '' '' \
         'secure' \
         'y')
     run_with_stdin "$input" bash "$INSTALL" \
@@ -79,6 +79,8 @@ sandbox_init
 rm -f "$MXB_CONFIG_FILE"
 install_interactive
 assert_status 0 "the interactive install must succeed with the default secure mode"
+assert_not_contains "$LAST_OUTPUT" "Inbound TLS certificate chain" \
+    "certificate paths must not be prompted for in the default flow"
 assert_contains "$(cat "$MXB_CONFIG_FILE")" 'SMTP_TLS_MATCH_HOSTNAME=mail.example.com' \
     "the prompted host must become the certificate name"
 assert_contains "$(cat "$MXB_LOG_DIR/install.log")" "primary SMTP TLS verified for mail.example.com" \
@@ -105,6 +107,8 @@ assert_contains "$(cat "$MXB_MAPS_DIR/smtp_tls_policy")" "secure match=mail.exam
     "the default policy must verify the primary certificate"
 assert_contains "$(cat "$MXB_CONFIG_FILE")" 'SMTP_TLS_MODE=secure' "secure mode must be persisted"
 assert_contains "$(cat "$MXB_LOG_DIR/install.log")" "primary SMTP TLS verified" "verification must be logged"
+assert_contains "$LAST_OUTPUT" "MXB_SKIP_AUTO_TLS=1" \
+    "the summary must explain why automatic inbound TLS was skipped"
 
 begin "an unverifiable primary certificate aborts a secure install"
 sandbox_destroy
@@ -152,9 +156,13 @@ assert_contains "$(cat "$MXB_CONFIG_FILE")" 'OPERATIONAL_MAIL_TO=ops@example.net
 begin "inbound TLS is staged where the postfix user can read it"
 sandbox_destroy
 sandbox_init
+unset MXB_SKIP_AUTO_TLS
+mock_clear_calls
 make_cert_material
 install_local --inbound-tls-cert "$TEST_TMP/inbound.crt" --inbound-tls-key "$TEST_TMP/inbound.key"
 assert_status 0 "the installation should succeed"
+assert_eq "$(mock_calls_count 'certbot certonly')" "0" \
+    "an explicitly supplied certificate must not trigger a certificate request"
 assert_file "$MXB_POSTFIX_ETC/tls/mx2.example.com.crt" "the chain must be staged"
 assert_file "$MXB_POSTFIX_ETC/tls/mx2.example.com.key" "the key must be staged"
 assert_eq "$(map_value smtpd_tls_cert_file)" "$MXB_POSTFIX_ETC/tls/mx2.example.com.crt" \
@@ -183,6 +191,75 @@ assert_contains "$(cat "$MXB_LETSENCRYPT_DIR/renewal-hooks/deploy/mx-backup-mail
     "$MXB_POSTFIX_ETC/tls/mx2.example.com.key" "the hook must update the staged key"
 assert_contains "$(cat "$MXB_LOG_DIR/install.log")" "renewal hook" "the hook must be logged"
 
+begin "a certificate is requested automatically when none exists"
+sandbox_destroy
+sandbox_init
+unset MXB_SKIP_AUTO_TLS
+mock_clear_calls
+install_local
+assert_status 0 "the installation should succeed without a pre-existing certificate"
+assert_eq "$(mock_calls_count 'certbot certonly')" "1" \
+    "certbot must be asked for a certificate exactly once"
+assert_file "$MXB_POSTFIX_ETC/tls/mx2.example.com.crt" "the requested chain must be staged"
+assert_file "$MXB_POSTFIX_ETC/tls/mx2.example.com.key" "the requested key must be staged"
+assert_eq "$(map_value smtpd_tls_cert_file)" "$MXB_POSTFIX_ETC/tls/mx2.example.com.crt" \
+    "Postfix must use the requested certificate"
+assert_contains "$(cat "$MXB_CONFIG_FILE")" \
+    "SMTPD_TLS_CERT_FILE=$MXB_LETSENCRYPT_DIR/live/mx2.example.com/fullchain.pem" \
+    "the requested certificate source must be persisted"
+assert_contains "$(cat "$MXB_LOG_DIR/install.log")" "obtained an inbound TLS certificate" \
+    "the automatic request must be logged"
+assert_contains "$(cat "$MXB_LOG_DIR/install.log")" "inbound STARTTLS enabled" \
+    "STARTTLS must be enabled after a successful request"
+export MXB_SKIP_AUTO_TLS=1
+
+begin "a managed certificate keeps port 80 open for renewals"
+sandbox_destroy
+sandbox_init
+unset MXB_SKIP_AUTO_TLS
+mock_clear_calls
+run bash "$INSTALL" \
+    --non-interactive --skip-upgrade --skip-initial-sync --local-dir "$REPO_ROOT" \
+    --mailcow-host mail.example.com --primary-ip 203.0.113.10
+assert_status 0 "the installation should succeed"
+assert_eq "$(mock_calls_count 'ufw allow 80/tcp comment ACME HTTP-01 renewal')" "1" \
+    "the firewall must allow the renewal challenge port"
+assert_contains "$(cat "$MXB_LOG_DIR/install.log")" "HTTP: 80 (ACME renewal)" \
+    "the open renewal port must be logged"
+export MXB_SKIP_AUTO_TLS=1
+
+begin "a failed automatic certificate request degrades to no STARTTLS"
+sandbox_destroy
+sandbox_init
+unset MXB_SKIP_AUTO_TLS
+export MOCK_CERTBOT_FAIL=1
+install_local
+assert_status 0 "a certificate failure must not abort the installation"
+assert_eq "$(map_value smtpd_tls_cert_file)" "" "no certificate parameter may be written"
+assert_contains "$(cat "$MXB_LOG_DIR/install.log")" "could not obtain an inbound TLS certificate" \
+    "the failure must be logged"
+assert_contains "$(cat "$MXB_LOG_DIR/install.log")" "continuing without STARTTLS" \
+    "the degraded outcome must be explicit"
+assert_contains "$(cat "$MXB_LOG_DIR/install.log")" "MTA-STS or DANE" \
+    "the consequence must be reported"
+export MOCK_CERTBOT_FAIL=0
+export MXB_SKIP_AUTO_TLS=1
+
+begin "an unresolvable hostname skips the automatic certificate request"
+sandbox_destroy
+sandbox_init
+unset MXB_SKIP_AUTO_TLS
+export MOCK_DNS_FAIL=1
+mock_clear_calls
+install_local
+assert_status 0 "the installation should still succeed"
+assert_eq "$(mock_calls_count 'certbot certonly')" "0" \
+    "certbot must not run for a name that does not resolve"
+assert_contains "$(cat "$MXB_LOG_DIR/install.log")" "does not resolve" \
+    "the DNS reason must be logged"
+export MOCK_DNS_FAIL=0
+export MXB_SKIP_AUTO_TLS=1
+
 begin "a certificate for another hostname is refused"
 sandbox_destroy
 sandbox_init
@@ -196,11 +273,26 @@ export MOCK_CERT_HOST_MISMATCH=0
 begin "missing inbound TLS is reported, not silently accepted"
 sandbox_destroy
 sandbox_init
+unset MXB_SKIP_AUTO_TLS
+mock_clear_calls
 install_local --no-inbound-tls
 assert_status 0 "the installation should succeed without inbound TLS"
+assert_eq "$(mock_calls_count 'certbot certonly')" "0" \
+    "--no-inbound-tls must not request a certificate"
 assert_contains "$(cat "$MXB_LOG_DIR/install.log")" "MTA-STS or DANE" \
     "the consequence must be logged"
 assert_eq "$(map_value smtpd_tls_cert_file)" "" "no certificate parameter may be written"
+assert_contains "$LAST_OUTPUT" "Inbound TLS is off (--no-inbound-tls)" \
+    "the summary must not promise an automatic request after --no-inbound-tls"
+export MXB_SKIP_AUTO_TLS=1
+
+begin "the summary names both TLS opt-outs when both are set"
+sandbox_destroy
+sandbox_init
+install_local --no-inbound-tls --skip-initial-sync
+assert_status 0 "the installation should succeed with both opt-outs"
+assert_contains "$LAST_OUTPUT" "Inbound TLS is off (--no-inbound-tls and MXB_SKIP_AUTO_TLS=1)" \
+    "the summary must explain that re-running requires removing both opt-outs"
 
 begin "--no-inbound-tls also clears a certificate from the configuration"
 sandbox_destroy

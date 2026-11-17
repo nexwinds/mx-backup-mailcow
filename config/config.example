@@ -29,12 +29,13 @@ MAILCOW_PRIMARY_PORT=25
 SMTP_TLS_MODE="secure"
 SMTP_TLS_MATCH_HOSTNAME="mail.example.com"
 
-# Inbound TLS material offered to sending MTAs. Point these at the renewal
-# store (certbot's /etc/letsencrypt/live/<hostname>/): install.sh copies the
-# chain and key into /etc/postfix/tls where the postfix user can read them, and
-# installs a certbot deploy hook so renewals update the copies.
-# Leave empty to run without STARTTLS (senders enforcing MTA-STS or DANE then
-# cannot deliver to this MX).
+# Inbound TLS material offered to sending MTAs. Point these at an existing
+# renewal store (certbot's /etc/letsencrypt/live/<hostname>/): install.sh copies
+# the chain and key into /etc/postfix/tls where the postfix user can read them,
+# and installs a certbot deploy hook so renewals update the copies.
+# Leave both empty and install.sh requests a Let's Encrypt certificate when the
+# hostname resolves and TCP/80 is reachable. If that is not possible, port 25
+# runs without STARTTLS (senders enforcing MTA-STS or DANE cannot deliver).
 SMTPD_TLS_CERT_FILE=""
 SMTPD_TLS_KEY_FILE=""
 

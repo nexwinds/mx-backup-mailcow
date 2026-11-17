@@ -92,6 +92,8 @@ mock_reset() {
     export MOCK_RSPAMD_CONFIGTEST_FAIL=0
     export MOCK_RSPAMD_RESTART_FAIL=0
     export MOCK_RSPAMD_DOWN=0
+    export MOCK_CERTBOT_FAIL=0
+    export MOCK_DNS_FAIL=0
 }
 
 mock_calls_contain() { grep -qF -- "$1" "$MOCK_DIR/calls.log"; }
@@ -537,7 +539,35 @@ openssl() {
     return 0
 }
 
-getent() { mock_log "getent $*"; printf '203.0.113.10    mail.example.com\n'; }
+certbot() {
+    mock_log "certbot $*"
+    if [[ "${MOCK_CERTBOT_FAIL:-0}" == "1" ]]; then
+        printf 'certbot: challenge failed for one or more domains\n' >&2
+        return 1
+    fi
+    local domain="" dir
+    while (( $# > 0 )); do
+        case "$1" in
+            -d|--domain) domain=${2:-}; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    if [[ -z "$domain" ]]; then
+        printf 'certbot: no domain requested\n' >&2
+        return 1
+    fi
+    dir="$MXB_LETSENCRYPT_DIR/live/$domain"
+    mkdir -p "$dir"
+    printf -- '-----BEGIN CERTIFICATE-----\nMIIBautoCert\n-----END CERTIFICATE-----\n' >"$dir/fullchain.pem"
+    printf -- '-----BEGIN PRIVATE KEY-----\nMIIBautoKey\n-----END PRIVATE KEY-----\n' >"$dir/privkey.pem"
+    return 0
+}
+
+getent() {
+    mock_log "getent $*"
+    [[ "${MOCK_DNS_FAIL:-0}" == "1" ]] && return 1
+    printf '203.0.113.10    mail.example.com\n'
+}
 
 needrestart() { mock_log "needrestart $*"; printf 'NEEDRESTART-VER: 3.5\n'; }
 
@@ -723,5 +753,5 @@ docker() {
 export -f mock_log mock_set_unit_state mock_get_unit_state mock_reset_postconf
 export -f mock_cidr_lookup mock_compose_exec
 export -f curl postmap postalias postconf postfix postqueue newaliases
-export -f systemctl journalctl ss free df timedatectl openssl getent needrestart ufw hostname
+export -f systemctl journalctl ss free df timedatectl openssl certbot getent needrestart ufw hostname
 export -f dpkg dpkg-query apt-get timeout docker
